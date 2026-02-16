@@ -30,7 +30,14 @@ def get_db():
     if _db is None:
         if not MONGODB_URI:
             return None
-        _client = MongoClient(MONGODB_URI)
+        # Add TLS settings for Vercel compatibility
+        _client = MongoClient(
+            MONGODB_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000
+        )
         _db = _client.fdaa
     return _db
 
