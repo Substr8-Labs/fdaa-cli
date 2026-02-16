@@ -207,7 +207,7 @@ async def process_memory_updates(
     persona: Optional[str],
     response: str
 ) -> tuple[str, bool]:
-    """Extract memory blocks and persist to MongoDB."""
+    """Extract memory blocks and persist to MongoDB with snapshots."""
     pattern = r"```memory:(\S+)\n(.*?)```"
     memory_updated = False
     
@@ -224,12 +224,17 @@ async def process_memory_updates(
             # Determine full path
             if persona:
                 path = f"personas/{persona}/{filename}"
+                actor = f"agent:{persona}"
             else:
                 path = filename
+                actor = "agent"
             
-            await database.update_file(workspace_id, path, content)
+            # Use snapshot-enabled update
+            snapshot = await database.update_file_with_snapshot(
+                workspace_id, path, content, actor=actor
+            )
             memory_updated = True
-            replacement = f"\n\n*[Memory updated: {filename}]*\n\n"
+            replacement = f"\n\n*[Memory updated: {filename} (v{snapshot['version']})*\n\n"
         
         clean_response = clean_response[:match.start()] + replacement + clean_response[match.end():]
     
@@ -424,6 +429,147 @@ async def chat_with_persona(workspace_id: str, persona: str, request: ChatReques
         persona=persona,
         memory_updated=memory_updated
     )
+
+
+# =============================================================================
+# Snapshotting / History API
+# =============================================================================
+
+class RollbackRequest(BaseModel):
+    target_version: int
+    actor: Optional[str] = None
+
+
+class SnapshotInfo(BaseModel):
+    workspace_id: str
+    path: str
+    version: int
+    content_hash: str
+    parent_hash: str
+    actor: str
+    timestamp: datetime
+
+
+@app.get("/workspaces/{workspace_id}/history/{path:path}")
+async def get_file_history(workspace_id: str, path: str, limit: int = 50):
+    """
+    Get version history for a file.
+    
+    Returns list of snapshots with metadata (content excluded for performance).
+    Use /workspaces/{id}/snapshots/{path}?version=N to get full content.
+    """
+    history = await database.get_file_history(workspace_id, path, limit)
+    return {
+        "workspace_id": workspace_id,
+        "path": path,
+        "total_versions": len(history),
+        "history": history
+    }
+
+
+@app.get("/workspaces/{workspace_id}/snapshots/{path:path}")
+async def get_snapshot(workspace_id: str, path: str, version: int):
+    """
+    Get a specific snapshot by version (includes full content).
+    """
+    snapshot = await database.get_snapshot(workspace_id, path, version)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail=f"Snapshot v{version} not found")
+    return snapshot
+
+
+@app.post("/workspaces/{workspace_id}/rollback/{path:path}")
+async def rollback_file(workspace_id: str, path: str, request: RollbackRequest):
+    """
+    Rollback a file to a previous version.
+    
+    Creates a NEW snapshot with the old content (history is preserved).
+    The rollback itself becomes a new entry in the chain.
+    """
+    snapshot = await database.rollback_to_version(
+        workspace_id, 
+        path, 
+        request.target_version,
+        request.actor
+    )
+    
+    if not snapshot:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Target version {request.target_version} not found"
+        )
+    
+    return {
+        "status": "rolled_back",
+        "restored_from": request.target_version,
+        "new_version": snapshot["version"],
+        "snapshot": snapshot
+    }
+
+
+@app.get("/workspaces/{workspace_id}/verify/{path:path}")
+async def verify_chain(workspace_id: str, path: str):
+    """
+    Verify the cryptographic integrity of a file's snapshot chain.
+    
+    Checks:
+    1. Hash chain is unbroken (parent_hash → content_hash linkage)
+    2. Content hashes match actual content (tamper detection)
+    """
+    result = await database.verify_snapshot_chain(workspace_id, path)
+    return result
+
+
+@app.get("/workspaces/{workspace_id}/personas/{persona}/history/{filename}")
+async def get_persona_file_history(
+    workspace_id: str, 
+    persona: str, 
+    filename: str,
+    limit: int = 50
+):
+    """Get version history for a persona's file."""
+    path = f"personas/{persona}/{filename}"
+    history = await database.get_file_history(workspace_id, path, limit)
+    return {
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "filename": filename,
+        "path": path,
+        "total_versions": len(history),
+        "history": history
+    }
+
+
+@app.post("/workspaces/{workspace_id}/personas/{persona}/rollback/{filename}")
+async def rollback_persona_file(
+    workspace_id: str, 
+    persona: str, 
+    filename: str,
+    request: RollbackRequest
+):
+    """Rollback a persona's file to a previous version."""
+    path = f"personas/{persona}/{filename}"
+    snapshot = await database.rollback_to_version(
+        workspace_id, 
+        path, 
+        request.target_version,
+        request.actor or f"user:rollback:{persona}"
+    )
+    
+    if not snapshot:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Target version {request.target_version} not found"
+        )
+    
+    return {
+        "status": "rolled_back",
+        "persona": persona,
+        "filename": filename,
+        "restored_from": request.target_version,
+        "new_version": snapshot["version"],
+        "snapshot": snapshot
+    }
 
 
 # Legacy endpoint (for backwards compatibility with simple /chat)

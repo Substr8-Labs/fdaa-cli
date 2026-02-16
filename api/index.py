@@ -1,10 +1,17 @@
 """
 FDAA API - Vercel Serverless (Flask)
+
+Features:
+- Workspace management
+- Persona-based chat
+- Cryptographic snapshotting (hash-chain versioning)
+- Rollback support
 """
 
 import os
 import re
 import json
+import hashlib
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
@@ -45,6 +52,10 @@ def get_db():
 # =============================================================================
 # Database Operations
 # =============================================================================
+
+# Genesis hash for snapshot chains
+GENESIS_HASH = "sha256:" + "0" * 64
+
 
 def get_workspace(workspace_id):
     db = get_db()
@@ -88,6 +99,166 @@ def update_file(workspace_id, path, content):
         {"$set": {"files": files, "updated_at": datetime.now(timezone.utc)}}
     )
     return result.modified_count > 0
+
+
+# =============================================================================
+# Snapshotting System
+# =============================================================================
+
+def compute_content_hash(content):
+    """Compute SHA256 hash of content."""
+    hash_bytes = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return f"sha256:{hash_bytes}"
+
+
+def create_snapshot(workspace_id, path, content, actor=None):
+    """
+    Create a versioned snapshot for a file update.
+    Implements hash-chain linking for cryptographic lineage.
+    """
+    db = get_db()
+    if db is None:
+        return None
+    
+    # Get the previous snapshot for this file
+    previous = db.snapshots.find_one(
+        {"workspace_id": workspace_id, "path": path},
+        sort=[("version", -1)]
+    )
+    
+    if previous:
+        parent_hash = previous["content_hash"]
+        version = previous["version"] + 1
+    else:
+        parent_hash = GENESIS_HASH
+        version = 1
+    
+    content_hash = compute_content_hash(content)
+    
+    snapshot = {
+        "workspace_id": workspace_id,
+        "path": path,
+        "content": content,
+        "content_hash": content_hash,
+        "parent_hash": parent_hash,
+        "version": version,
+        "actor": actor or "system",
+        "timestamp": datetime.now(timezone.utc),
+    }
+    
+    db.snapshots.insert_one(snapshot)
+    snapshot.pop("_id", None)
+    return snapshot
+
+
+def get_file_history(workspace_id, path, limit=50):
+    """Get version history for a file."""
+    db = get_db()
+    if db is None:
+        return []
+    
+    snapshots = list(db.snapshots.find(
+        {"workspace_id": workspace_id, "path": path},
+        {"content": 0}  # Exclude content for performance
+    ).sort("version", -1).limit(limit))
+    
+    for s in snapshots:
+        s["_id"] = str(s["_id"])
+    
+    return snapshots
+
+
+def get_snapshot(workspace_id, path, version):
+    """Get a specific snapshot by version."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    snapshot = db.snapshots.find_one({
+        "workspace_id": workspace_id,
+        "path": path,
+        "version": version
+    })
+    
+    if snapshot:
+        snapshot["_id"] = str(snapshot["_id"])
+    
+    return snapshot
+
+
+def rollback_to_version(workspace_id, path, target_version, actor=None):
+    """
+    Rollback a file to a previous version.
+    Creates a NEW snapshot with the old content (preserves history).
+    """
+    target = get_snapshot(workspace_id, path, target_version)
+    if not target:
+        return None
+    
+    # Create a new snapshot with the old content
+    new_snapshot = create_snapshot(
+        workspace_id, 
+        path, 
+        target["content"],
+        actor=actor or f"rollback:v{target_version}"
+    )
+    
+    # Also update the live workspace file
+    update_file(workspace_id, path, target["content"])
+    
+    return new_snapshot
+
+
+def verify_snapshot_chain(workspace_id, path):
+    """Verify the integrity of a file's snapshot chain."""
+    db = get_db()
+    if db is None:
+        return {"valid": False, "error": "Database not connected"}
+    
+    snapshots = list(db.snapshots.find(
+        {"workspace_id": workspace_id, "path": path}
+    ).sort("version", 1))
+    
+    if not snapshots:
+        return {"valid": True, "message": "No snapshots found", "chain_length": 0}
+    
+    errors = []
+    previous_hash = GENESIS_HASH
+    
+    for snapshot in snapshots:
+        # Check parent hash
+        if snapshot["parent_hash"] != previous_hash:
+            errors.append({
+                "version": snapshot["version"],
+                "error": "broken_chain",
+                "expected_parent": previous_hash,
+                "actual_parent": snapshot["parent_hash"]
+            })
+        
+        # Verify content hash
+        computed_hash = compute_content_hash(snapshot["content"])
+        if computed_hash != snapshot["content_hash"]:
+            errors.append({
+                "version": snapshot["version"],
+                "error": "content_tampered",
+                "expected_hash": computed_hash,
+                "stored_hash": snapshot["content_hash"]
+            })
+        
+        previous_hash = snapshot["content_hash"]
+    
+    return {
+        "valid": len(errors) == 0,
+        "chain_length": len(snapshots),
+        "errors": errors if errors else None
+    }
+
+
+def update_file_with_snapshot(workspace_id, path, content, actor=None):
+    """Update a file AND create a snapshot."""
+    snapshot = create_snapshot(workspace_id, path, content, actor)
+    update_file(workspace_id, path, content)
+    return snapshot
 
 
 # =============================================================================
@@ -190,9 +361,16 @@ def process_memory_updates(workspace_id, persona, response):
             replacement = f"\n\n*[Blocked: Cannot write to {filename}]*\n\n"
         else:
             path = f"personas/{persona}/{filename}" if persona else filename
-            update_file(workspace_id, path, content)
+            actor = f"agent:{persona}" if persona else "agent"
+            
+            # Use snapshot-enabled update
+            snapshot = update_file_with_snapshot(workspace_id, path, content, actor)
             memory_updated = True
-            replacement = f"\n\n*[Memory updated: {filename}]*\n\n"
+            
+            if snapshot:
+                replacement = f"\n\n*[Memory updated: {filename} (v{snapshot['version']})*\n\n"
+            else:
+                replacement = f"\n\n*[Memory updated: {filename}]*\n\n"
         
         clean_response = clean_response[:match.start()] + replacement + clean_response[match.end():]
     
@@ -321,7 +499,7 @@ def get_persona_context(workspace_id, persona):
 
 @app.route("/api/workspaces/<workspace_id>/personas/<persona>/memory", methods=["POST"])
 def update_persona_memory(workspace_id, persona):
-    """Update persona memory directly"""
+    """Update persona memory directly (with snapshot)"""
     try:
         workspace = get_workspace(workspace_id)
         if workspace is None:
@@ -330,6 +508,7 @@ def update_persona_memory(workspace_id, persona):
         data = request.get_json()
         content = data.get("content")
         filename = data.get("filename", "MEMORY.md")
+        actor = data.get("actor", "api")
         
         if not content:
             return jsonify({"error": "content required"}), 400
@@ -338,11 +517,15 @@ def update_persona_memory(workspace_id, persona):
             return jsonify({"error": f"Cannot write to {filename}"}), 403
         
         path = f"personas/{persona}/{filename}"
-        success = update_file(workspace_id, path, content)
+        
+        # Use snapshot-enabled update
+        snapshot = update_file_with_snapshot(workspace_id, path, content, actor)
         
         return jsonify({
-            "success": success,
-            "path": path
+            "success": snapshot is not None,
+            "path": path,
+            "version": snapshot["version"] if snapshot else None,
+            "content_hash": snapshot["content_hash"] if snapshot else None
         })
     except Exception as e:
         return jsonify({"error": str(e), "type": type(e).__name__}), 500
@@ -393,3 +576,128 @@ def chat_with_persona(workspace_id, persona):
             "type": type(e).__name__,
             "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY"))
         }), 500
+
+
+# =============================================================================
+# Snapshotting / History API
+# =============================================================================
+
+@app.route("/api/workspaces/<workspace_id>/history/<path:path>")
+def api_get_file_history(workspace_id, path):
+    """
+    Get version history for a file.
+    Returns list of snapshots with metadata (content excluded).
+    """
+    limit = request.args.get("limit", 50, type=int)
+    history = get_file_history(workspace_id, path, limit)
+    
+    return jsonify({
+        "workspace_id": workspace_id,
+        "path": path,
+        "total_versions": len(history),
+        "history": history
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/snapshots/<path:path>")
+def api_get_snapshot(workspace_id, path):
+    """Get a specific snapshot by version (includes full content)."""
+    version = request.args.get("version", type=int)
+    if version is None:
+        return jsonify({"error": "version parameter required"}), 400
+    
+    snapshot = get_snapshot(workspace_id, path, version)
+    if not snapshot:
+        return jsonify({"error": f"Snapshot v{version} not found"}), 404
+    
+    return jsonify(snapshot)
+
+
+@app.route("/api/workspaces/<workspace_id>/rollback/<path:path>", methods=["POST"])
+def api_rollback_file(workspace_id, path):
+    """
+    Rollback a file to a previous version.
+    Creates a NEW snapshot with the old content (history preserved).
+    """
+    data = request.get_json()
+    target_version = data.get("target_version")
+    actor = data.get("actor")
+    
+    if target_version is None:
+        return jsonify({"error": "target_version required"}), 400
+    
+    snapshot = rollback_to_version(workspace_id, path, target_version, actor)
+    
+    if not snapshot:
+        return jsonify({"error": f"Target version {target_version} not found"}), 404
+    
+    return jsonify({
+        "status": "rolled_back",
+        "restored_from": target_version,
+        "new_version": snapshot["version"],
+        "snapshot": snapshot
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/verify/<path:path>")
+def api_verify_chain(workspace_id, path):
+    """
+    Verify the cryptographic integrity of a file's snapshot chain.
+    
+    Checks:
+    1. Hash chain is unbroken
+    2. Content hashes match actual content
+    """
+    result = verify_snapshot_chain(workspace_id, path)
+    return jsonify(result)
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/history/<filename>")
+def api_get_persona_history(workspace_id, persona, filename):
+    """Get version history for a persona's file."""
+    limit = request.args.get("limit", 50, type=int)
+    path = f"personas/{persona}/{filename}"
+    history = get_file_history(workspace_id, path, limit)
+    
+    return jsonify({
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "filename": filename,
+        "path": path,
+        "total_versions": len(history),
+        "history": history
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/rollback/<filename>", methods=["POST"])
+def api_rollback_persona_file(workspace_id, persona, filename):
+    """Rollback a persona's file to a previous version."""
+    data = request.get_json()
+    target_version = data.get("target_version")
+    actor = data.get("actor", f"user:rollback:{persona}")
+    
+    if target_version is None:
+        return jsonify({"error": "target_version required"}), 400
+    
+    path = f"personas/{persona}/{filename}"
+    snapshot = rollback_to_version(workspace_id, path, target_version, actor)
+    
+    if not snapshot:
+        return jsonify({"error": f"Target version {target_version} not found"}), 404
+    
+    return jsonify({
+        "status": "rolled_back",
+        "persona": persona,
+        "filename": filename,
+        "restored_from": target_version,
+        "new_version": snapshot["version"],
+        "snapshot": snapshot
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/verify/<filename>")
+def api_verify_persona_chain(workspace_id, persona, filename):
+    """Verify the cryptographic integrity of a persona file's snapshot chain."""
+    path = f"personas/{persona}/{filename}"
+    result = verify_snapshot_chain(workspace_id, path)
+    return jsonify(result)
