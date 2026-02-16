@@ -1347,6 +1347,219 @@ def api_skill_audit(workspace_id):
 
 
 # =============================================================================
+# Mock Services (Downstream Simulation)
+# =============================================================================
+
+@app.route("/api/mock/slack/send", methods=["POST"])
+def mock_slack_send():
+    """
+    Mock Slack message sending.
+    Simulates: POST https://slack.com/api/chat.postMessage
+    """
+    data = request.get_json() or {}
+    channel = data.get("channel", "#general")
+    text = data.get("text", "")
+    
+    # Simulate response
+    return jsonify({
+        "ok": True,
+        "channel": channel,
+        "ts": f"1708123456.{hash(text) % 100000:06d}",
+        "message": {
+            "type": "message",
+            "text": text,
+            "user": "U_MOCK_BOT",
+            "ts": f"1708123456.{hash(text) % 100000:06d}"
+        },
+        "_mock": True,
+        "_service": "slack"
+    })
+
+
+@app.route("/api/mock/slack/channels", methods=["GET"])
+def mock_slack_channels():
+    """Mock Slack channel list."""
+    return jsonify({
+        "ok": True,
+        "channels": [
+            {"id": "C001", "name": "general", "is_member": True},
+            {"id": "C002", "name": "engineering", "is_member": True},
+            {"id": "C003", "name": "product", "is_member": True},
+            {"id": "C004", "name": "random", "is_member": False},
+        ],
+        "_mock": True
+    })
+
+
+@app.route("/api/mock/email/send", methods=["POST"])
+def mock_email_send():
+    """
+    Mock email sending.
+    Simulates: Gmail/SendGrid API
+    """
+    data = request.get_json() or {}
+    to = data.get("to", "unknown@example.com")
+    subject = data.get("subject", "No Subject")
+    body = data.get("body", "")
+    
+    return jsonify({
+        "success": True,
+        "message_id": f"mock_{hash(to + subject) % 1000000:06d}",
+        "to": to,
+        "subject": subject,
+        "status": "sent",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "_mock": True,
+        "_service": "email"
+    })
+
+
+@app.route("/api/mock/calendar/events", methods=["GET", "POST"])
+def mock_calendar_events():
+    """Mock calendar events."""
+    if request.method == "GET":
+        return jsonify({
+            "events": [
+                {
+                    "id": "evt_001",
+                    "title": "Team Standup",
+                    "start": "2026-02-17T09:00:00Z",
+                    "end": "2026-02-17T09:30:00Z",
+                    "attendees": ["ada@company.com", "grace@company.com"]
+                },
+                {
+                    "id": "evt_002", 
+                    "title": "Product Review",
+                    "start": "2026-02-17T14:00:00Z",
+                    "end": "2026-02-17T15:00:00Z",
+                    "attendees": ["grace@company.com", "val@company.com"]
+                }
+            ],
+            "_mock": True
+        })
+    
+    # POST - create event
+    data = request.get_json() or {}
+    return jsonify({
+        "success": True,
+        "event_id": f"evt_{hash(str(data)) % 10000:04d}",
+        "title": data.get("title", "New Event"),
+        "created": True,
+        "_mock": True
+    })
+
+
+@app.route("/api/mock/github/issues", methods=["GET", "POST"])
+def mock_github_issues():
+    """Mock GitHub issues."""
+    if request.method == "GET":
+        return jsonify({
+            "issues": [
+                {"number": 42, "title": "Fix login bug", "state": "open", "labels": ["bug"]},
+                {"number": 41, "title": "Add dark mode", "state": "open", "labels": ["feature"]},
+                {"number": 40, "title": "Update docs", "state": "closed", "labels": ["docs"]},
+            ],
+            "_mock": True
+        })
+    
+    # POST - create issue
+    data = request.get_json() or {}
+    return jsonify({
+        "success": True,
+        "number": 43,
+        "title": data.get("title", "New Issue"),
+        "url": "https://github.com/mock/repo/issues/43",
+        "_mock": True
+    })
+
+
+@app.route("/api/mock/notion/pages", methods=["GET", "POST"])
+def mock_notion_pages():
+    """Mock Notion pages."""
+    if request.method == "GET":
+        return jsonify({
+            "pages": [
+                {"id": "page_001", "title": "Project Roadmap", "last_edited": "2026-02-15"},
+                {"id": "page_002", "title": "Meeting Notes", "last_edited": "2026-02-16"},
+            ],
+            "_mock": True
+        })
+    
+    # POST - create page
+    data = request.get_json() or {}
+    return jsonify({
+        "success": True,
+        "page_id": f"page_{hash(str(data)) % 10000:04d}",
+        "title": data.get("title", "New Page"),
+        "url": "https://notion.so/mock-page",
+        "_mock": True
+    })
+
+
+@app.route("/api/mock/linear/issues", methods=["GET", "POST"])
+def mock_linear_issues():
+    """Mock Linear issues."""
+    if request.method == "GET":
+        return jsonify({
+            "issues": [
+                {"id": "LIN-101", "title": "Implement auth flow", "status": "In Progress", "priority": 1},
+                {"id": "LIN-102", "title": "Design review", "status": "Todo", "priority": 2},
+            ],
+            "_mock": True
+        })
+    
+    data = request.get_json() or {}
+    return jsonify({
+        "success": True,
+        "id": "LIN-103",
+        "title": data.get("title", "New Issue"),
+        "_mock": True
+    })
+
+
+@app.route("/api/mock/webhook", methods=["POST"])
+def mock_webhook():
+    """
+    Generic webhook endpoint.
+    Echoes back whatever you send + metadata.
+    """
+    data = request.get_json() or {}
+    
+    return jsonify({
+        "received": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "payload": data,
+        "headers": {
+            "content_type": request.content_type,
+            "user_agent": request.headers.get("User-Agent", "unknown")
+        },
+        "_mock": True,
+        "_service": "webhook"
+    })
+
+
+@app.route("/api/mock/execute", methods=["POST"])
+def mock_execute():
+    """
+    Generic skill execution mock.
+    Takes any action and returns success.
+    """
+    data = request.get_json() or {}
+    action = data.get("action", "unknown")
+    params = data.get("params", {})
+    
+    return jsonify({
+        "success": True,
+        "action": action,
+        "params": params,
+        "result": f"Mock executed: {action}",
+        "execution_time_ms": 42,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "_mock": True
+    })
+
+
+# =============================================================================
 # Snapshotting / History API
 # =============================================================================
 
