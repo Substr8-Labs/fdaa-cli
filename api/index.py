@@ -273,12 +273,15 @@ def install_skill(workspace_id, skill):
     {
         "skill_id": "security-reviewer",
         "name": "Security Reviewer",
+        "type": "knowledge",               # knowledge | tool | connector | composite
         "description": "OWASP-aligned reviews. Trigger on 'security scan'.",
         "instructions": "# Full SKILL.md content...",
-        "scripts": {"scan.py": "..."},       # Optional
-        "references": {"guide.md": "..."},   # Optional
-        "author": "substr8-labs",            # Optional
-        "version": 1,                        # Optional
+        "scripts": {"scan.py": "..."},     # Optional
+        "references": {"guide.md": "..."},  # Optional
+        "author": "substr8-labs",           # Optional
+        "version": 1,                       # Optional
+        "permissions": {...},               # Optional - access control
+        "dependencies": {...},              # Optional - connectors/skills required
     }
     """
     db = get_db()
@@ -291,6 +294,8 @@ def install_skill(workspace_id, skill):
         "workspace_id": workspace_id,
         "skill_id": skill["skill_id"],
         "name": skill.get("name", skill["skill_id"]),
+        "type": skill.get("type", "knowledge"),
+        "category": skill.get("category", "general"),
         "description": skill.get("description", ""),
         "instructions": skill.get("instructions", ""),
         "scripts": skill.get("scripts", {}),
@@ -300,6 +305,8 @@ def install_skill(workspace_id, skill):
         "signature": skill.get("signature"),
         "verified": skill.get("verified", False),
         "trust_score": skill.get("trust_score"),
+        "permissions": skill.get("permissions", {}),
+        "dependencies": skill.get("dependencies", {}),
         "installed_at": now,
         "updated_at": now,
     }
