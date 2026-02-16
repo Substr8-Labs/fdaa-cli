@@ -700,7 +700,17 @@ def chat(workspace_id):
 
 @app.route("/api/workspaces/<workspace_id>/personas/<persona>/context")
 def get_persona_context(workspace_id, persona):
-    """Get assembled prompt for a persona (no LLM call)"""
+    """
+    Get assembled prompt for a persona (no LLM call).
+    
+    Optional query params:
+    - message: User message to trigger skill activation
+    
+    Returns:
+    - system_prompt: Assembled prompt with skill index
+    - activated_skills: List of skills triggered by message (if provided)
+    - available_skills: Total skills available
+    """
     try:
         workspace = get_workspace(workspace_id)
         if workspace is None:
@@ -713,12 +723,32 @@ def get_persona_context(workspace_id, persona):
         if not has_persona:
             return jsonify({"error": f"Persona '{persona}' not found"}), 404
         
-        system_prompt = assemble_prompt(workspace_id, persona)
+        # Get optional message for skill activation
+        user_message = request.args.get("message")
+        
+        # Assemble prompt (includes skill matching if message provided)
+        system_prompt = assemble_prompt(workspace_id, persona, user_message=user_message)
+        
+        # Get skill info for response
+        skill_index = get_skill_index(workspace_id)
+        activated_skills = []
+        
+        if user_message and skill_index:
+            matched_ids = match_skills(user_message, skill_index)
+            for skill in skill_index:
+                if skill["skill_id"] in matched_ids:
+                    activated_skills.append({
+                        "skill_id": skill["skill_id"],
+                        "name": skill["name"],
+                        "description": skill["description"]
+                    })
         
         return jsonify({
             "workspace_id": workspace_id,
             "persona": persona,
-            "system_prompt": system_prompt
+            "system_prompt": system_prompt,
+            "available_skills": len(skill_index),
+            "activated_skills": activated_skills
         })
     except Exception as e:
         return jsonify({"error": str(e), "type": type(e).__name__}), 500
