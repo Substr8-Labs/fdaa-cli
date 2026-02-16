@@ -293,6 +293,61 @@ def chat(workspace_id):
     })
 
 
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/context")
+def get_persona_context(workspace_id, persona):
+    """Get assembled prompt for a persona (no LLM call)"""
+    try:
+        workspace = get_workspace(workspace_id)
+        if workspace is None:
+            return jsonify({"error": "Workspace not found"}), 404
+        
+        files = workspace.get("files", {})
+        persona_prefix = f"personas/{persona}/"
+        has_persona = any(path.startswith(persona_prefix) for path in (files.keys() if isinstance(files, dict) else []))
+        
+        if not has_persona:
+            return jsonify({"error": f"Persona '{persona}' not found"}), 404
+        
+        system_prompt = assemble_prompt(workspace_id, persona)
+        
+        return jsonify({
+            "workspace_id": workspace_id,
+            "persona": persona,
+            "system_prompt": system_prompt
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/memory", methods=["POST"])
+def update_persona_memory(workspace_id, persona):
+    """Update persona memory directly"""
+    try:
+        workspace = get_workspace(workspace_id)
+        if workspace is None:
+            return jsonify({"error": "Workspace not found"}), 404
+        
+        data = request.get_json()
+        content = data.get("content")
+        filename = data.get("filename", "MEMORY.md")
+        
+        if not content:
+            return jsonify({"error": "content required"}), 400
+        
+        if filename not in WRITABLE_FILES:
+            return jsonify({"error": f"Cannot write to {filename}"}), 403
+        
+        path = f"personas/{persona}/{filename}"
+        success = update_file(workspace_id, path, content)
+        
+        return jsonify({
+            "success": success,
+            "path": path
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+
 @app.route("/api/workspaces/<workspace_id>/personas/<persona>/chat", methods=["POST"])
 def chat_with_persona(workspace_id, persona):
     try:
