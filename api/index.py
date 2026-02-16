@@ -10,7 +10,7 @@ from typing import Optional, Dict, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from mangum import Mangum
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # =============================================================================
 # Configuration
@@ -33,7 +33,6 @@ def get_db():
     if _db is None:
         if not MONGODB_URI:
             raise HTTPException(status_code=500, detail="MONGODB_URI not configured")
-        from motor.motor_asyncio import AsyncIOMotorClient
         _client = AsyncIOMotorClient(MONGODB_URI)
         _db = _client.fdaa
     return _db
@@ -301,5 +300,3 @@ async def chat_with_persona(workspace_id: str, persona: str, request: ChatReques
     return ChatResponse(response=clean_response, workspace_id=workspace_id, persona=persona, memory_updated=memory_updated)
 
 
-# Vercel serverless handler
-handler = Mangum(app)
