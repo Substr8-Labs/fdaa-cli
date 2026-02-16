@@ -41,7 +41,7 @@ def get_db():
 
 def get_workspace(workspace_id):
     db = get_db()
-    if not db:
+    if db is None:
         return None
     workspace = db.workspaces.find_one({"_id": workspace_id})
     if not workspace:
@@ -202,7 +202,7 @@ def health():
     import traceback
     try:
         db = get_db()
-        if db:
+        if db is not None:
             # Test actual connection
             db.command("ping")
             return jsonify({"status": "healthy", "db": "connected"})
@@ -221,7 +221,7 @@ def health():
 @app.route("/api/workspaces")
 def list_workspaces():
     db = get_db()
-    if not db:
+    if db is None:
         return jsonify({"error": "Database not configured"}), 500
     
     workspaces = []
