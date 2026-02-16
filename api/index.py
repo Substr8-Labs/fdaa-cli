@@ -10,15 +10,13 @@ from typing import Optional, Dict, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
+from mangum import Mangum
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-MONGODB_URI = os.environ.get("MONGODB_URI")
-if not MONGODB_URI:
-    raise ValueError("MONGODB_URI environment variable required")
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
 
 # File injection order (FDAA spec)
 INJECTION_ORDER = ["IDENTITY.md", "SOUL.md", "CONTEXT.md", "MEMORY.md", "TOOLS.md"]
@@ -26,9 +24,19 @@ INJECTION_ORDER = ["IDENTITY.md", "SOUL.md", "CONTEXT.md", "MEMORY.md", "TOOLS.m
 # W^X Policy
 WRITABLE_FILES = {"MEMORY.md", "CONTEXT.md"}
 
-# MongoDB client (connection pooling handled by Motor)
-client = AsyncIOMotorClient(MONGODB_URI)
-db = client.fdaa
+# Lazy MongoDB connection
+_client = None
+_db = None
+
+def get_db():
+    global _client, _db
+    if _db is None:
+        if not MONGODB_URI:
+            raise HTTPException(status_code=500, detail="MONGODB_URI not configured")
+        from motor.motor_asyncio import AsyncIOMotorClient
+        _client = AsyncIOMotorClient(MONGODB_URI)
+        _db = _client.fdaa
+    return _db
 
 # =============================================================================
 # Models
@@ -59,9 +67,9 @@ class WorkspaceInfo(BaseModel):
 # =============================================================================
 
 async def get_workspace(workspace_id: str) -> Optional[Dict]:
-    workspace = await db.workspaces.find_one({"_id": workspace_id})
+    workspace = await get_db().workspaces.find_one({"_id": workspace_id})
     if not workspace:
-        workspace = await db.workspaces.find_one({"name": workspace_id})
+        workspace = await get_db().workspaces.find_one({"name": workspace_id})
     return workspace
 
 
@@ -88,7 +96,7 @@ async def update_file(workspace_id: str, path: str, content: str) -> bool:
     
     files[path] = {"content": content}
     
-    result = await db.workspaces.update_one(
+    result = await get_db().workspaces.update_one(
         {"_id": workspace["_id"]},
         {"$set": {"files": files, "updated_at": datetime.now(timezone.utc)}}
     )
@@ -235,7 +243,7 @@ async def health():
 @app.get("/api/workspaces")
 async def list_workspaces() -> List[WorkspaceInfo]:
     workspaces = []
-    async for ws in db.workspaces.find({}, {"_id": 1, "name": 1, "files": 1}):
+    async for ws in get_db().workspaces.find({}, {"_id": 1, "name": 1, "files": 1}):
         personas = set()
         files = ws.get("files", {})
         if isinstance(files, dict):
@@ -291,3 +299,7 @@ async def chat_with_persona(workspace_id: str, persona: str, request: ChatReques
     clean_response, memory_updated = await process_memory_updates(workspace_id, persona, response)
     
     return ChatResponse(response=clean_response, workspace_id=workspace_id, persona=persona, memory_updated=memory_updated)
+
+
+# Vercel serverless handler
+handler = Mangum(app)
