@@ -51,14 +51,14 @@ def get_workspace(workspace_id):
     if db is None:
         return None
     workspace = db.workspaces.find_one({"_id": workspace_id})
-    if not workspace:
+    if workspace is None:
         workspace = db.workspaces.find_one({"name": workspace_id})
     return workspace
 
 
 def get_files(workspace_id):
     workspace = get_workspace(workspace_id)
-    if workspace:
+    if workspace is not None:
         files = workspace.get("files", {})
         if isinstance(files, dict):
             result = {}
@@ -74,7 +74,7 @@ def get_files(workspace_id):
 def update_file(workspace_id, path, content):
     db = get_db()
     workspace = get_workspace(workspace_id)
-    if not workspace or not db:
+    if workspace is None or db is None:
         return False
     
     files = workspace.get("files", {})
@@ -259,7 +259,7 @@ def list_workspaces():
 @app.route("/api/workspaces/<workspace_id>")
 def get_workspace_info(workspace_id):
     workspace = get_workspace(workspace_id)
-    if not workspace:
+    if workspace is None:
         return jsonify({"error": "Workspace not found"}), 404
     
     # Convert ObjectId to string for JSON
@@ -270,7 +270,7 @@ def get_workspace_info(workspace_id):
 @app.route("/api/workspaces/<workspace_id>/chat", methods=["POST"])
 def chat(workspace_id):
     workspace = get_workspace(workspace_id)
-    if not workspace:
+    if workspace is None:
         return jsonify({"error": "Workspace not found"}), 404
     
     data = request.get_json()
@@ -297,7 +297,7 @@ def chat(workspace_id):
 def chat_with_persona(workspace_id, persona):
     try:
         workspace = get_workspace(workspace_id)
-        if not workspace:
+        if workspace is None:
             return jsonify({"error": "Workspace not found"}), 404
         
         files = workspace.get("files", {})
