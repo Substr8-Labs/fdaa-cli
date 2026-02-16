@@ -1,16 +1,13 @@
 """
-FDAA API - Vercel Serverless Entry Point
+FDAA API - Vercel Serverless (Flask)
 """
 
 import os
 import re
+import json
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
+from flask import Flask, request, jsonify
+from pymongo import MongoClient
 
 # =============================================================================
 # Configuration
@@ -32,48 +29,28 @@ def get_db():
     global _client, _db
     if _db is None:
         if not MONGODB_URI:
-            raise HTTPException(status_code=500, detail="MONGODB_URI not configured")
-        _client = AsyncIOMotorClient(MONGODB_URI)
+            return None
+        _client = MongoClient(MONGODB_URI)
         _db = _client.fdaa
     return _db
-
-# =============================================================================
-# Models
-# =============================================================================
-
-class ChatRequest(BaseModel):
-    message: str
-    provider: str = "anthropic"
-    model: Optional[str] = None
-    history: Optional[List[Dict[str, str]]] = None
-
-
-class ChatResponse(BaseModel):
-    response: str
-    workspace_id: str
-    persona: Optional[str] = None
-    memory_updated: bool = False
-
-
-class WorkspaceInfo(BaseModel):
-    id: str
-    name: str
-    personas: List[str]
 
 
 # =============================================================================
 # Database Operations
 # =============================================================================
 
-async def get_workspace(workspace_id: str) -> Optional[Dict]:
-    workspace = await get_db().workspaces.find_one({"_id": workspace_id})
+def get_workspace(workspace_id):
+    db = get_db()
+    if not db:
+        return None
+    workspace = db.workspaces.find_one({"_id": workspace_id})
     if not workspace:
-        workspace = await get_db().workspaces.find_one({"name": workspace_id})
+        workspace = db.workspaces.find_one({"name": workspace_id})
     return workspace
 
 
-async def get_files(workspace_id: str) -> Dict[str, str]:
-    workspace = await get_workspace(workspace_id)
+def get_files(workspace_id):
+    workspace = get_workspace(workspace_id)
     if workspace:
         files = workspace.get("files", {})
         if isinstance(files, dict):
@@ -84,9 +61,10 @@ async def get_files(workspace_id: str) -> Dict[str, str]:
     return {}
 
 
-async def update_file(workspace_id: str, path: str, content: str) -> bool:
-    workspace = await get_workspace(workspace_id)
-    if not workspace:
+def update_file(workspace_id, path, content):
+    db = get_db()
+    workspace = get_workspace(workspace_id)
+    if not workspace or not db:
         return False
     
     files = workspace.get("files", {})
@@ -95,7 +73,7 @@ async def update_file(workspace_id: str, path: str, content: str) -> bool:
     
     files[path] = {"content": content}
     
-    result = await get_db().workspaces.update_one(
+    result = db.workspaces.update_one(
         {"_id": workspace["_id"]},
         {"$set": {"files": files, "updated_at": datetime.now(timezone.utc)}}
     )
@@ -106,36 +84,8 @@ async def update_file(workspace_id: str, path: str, content: str) -> bool:
 # Agent Logic
 # =============================================================================
 
-def _default_model(provider: str) -> str:
-    return {"openai": "gpt-4o", "anthropic": "claude-sonnet-4-20250514"}.get(provider, "claude-sonnet-4-20250514")
-
-
-def _system_instructions() -> str:
-    return """## System Instructions
-
-You are an AI agent defined by the files above. Follow these rules:
-
-1. **Stay in character** as defined by IDENTITY.md and SOUL.md
-2. **Remember context** from MEMORY.md and CONTEXT.md
-3. **Use capabilities** listed in TOOLS.md (if present)
-
-### Memory Updates
-
-When you learn something important, include a memory update block:
-
-```memory:MEMORY.md
-[Your updated memory content here]
-```
-
-### Boundaries
-
-- You CANNOT modify IDENTITY.md or SOUL.md
-- You CAN update MEMORY.md and CONTEXT.md
-"""
-
-
-async def assemble_prompt(workspace_id: str, persona: Optional[str] = None) -> str:
-    all_files = await get_files(workspace_id)
+def assemble_prompt(workspace_id, persona=None):
+    all_files = get_files(workspace_id)
     
     files = {}
     if persona:
@@ -159,19 +109,39 @@ async def assemble_prompt(workspace_id: str, persona: Optional[str] = None) -> s
         if filename not in INJECTION_ORDER:
             sections.append(f"## {filename}\n\n{content}")
     
-    sections.append(_system_instructions())
+    sections.append("""## System Instructions
+
+You are an AI agent defined by the files above. Follow these rules:
+
+1. **Stay in character** as defined by IDENTITY.md and SOUL.md
+2. **Remember context** from MEMORY.md and CONTEXT.md
+3. **Use capabilities** listed in TOOLS.md (if present)
+
+### Memory Updates
+
+When you learn something important, include a memory update block:
+
+```memory:MEMORY.md
+[Your updated memory content here]
+```
+
+### Boundaries
+
+- You CANNOT modify IDENTITY.md or SOUL.md
+- You CAN update MEMORY.md and CONTEXT.md
+""")
     return "\n\n---\n\n".join(sections)
 
 
-async def call_llm(system_prompt: str, history: List[Dict], message: str, provider: str = "anthropic", model: Optional[str] = None) -> str:
-    model = model or _default_model(provider)
+def call_llm(system_prompt, history, message, provider="anthropic", model=None):
     messages = list(history) if history else []
     messages.append({"role": "user", "content": message})
     
     if provider == "anthropic":
-        from anthropic import AsyncAnthropic
-        client = AsyncAnthropic()
-        response = await client.messages.create(
+        from anthropic import Anthropic
+        client = Anthropic()
+        model = model or "claude-sonnet-4-20250514"
+        response = client.messages.create(
             model=model,
             max_tokens=4096,
             system=system_prompt,
@@ -179,9 +149,10 @@ async def call_llm(system_prompt: str, history: List[Dict], message: str, provid
         )
         return response.content[0].text
     elif provider == "openai":
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI()
-        response = await client.chat.completions.create(
+        from openai import OpenAI
+        client = OpenAI()
+        model = model or "gpt-4o"
+        response = client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system_prompt}] + messages,
         )
@@ -190,7 +161,7 @@ async def call_llm(system_prompt: str, history: List[Dict], message: str, provid
         raise ValueError(f"Unknown provider: {provider}")
 
 
-async def process_memory_updates(workspace_id: str, persona: Optional[str], response: str) -> tuple[str, bool]:
+def process_memory_updates(workspace_id, persona, response):
     pattern = r"```memory:(\S+)\n(.*?)```"
     memory_updated = False
     
@@ -205,7 +176,7 @@ async def process_memory_updates(workspace_id: str, persona: Optional[str], resp
             replacement = f"\n\n*[Blocked: Cannot write to {filename}]*\n\n"
         else:
             path = f"personas/{persona}/{filename}" if persona else filename
-            await update_file(workspace_id, path, content)
+            update_file(workspace_id, path, content)
             memory_updated = True
             replacement = f"\n\n*[Memory updated: {filename}]*\n\n"
         
@@ -215,34 +186,31 @@ async def process_memory_updates(workspace_id: str, persona: Optional[str], resp
 
 
 # =============================================================================
-# FastAPI App
+# Flask App
 # =============================================================================
 
-app = FastAPI(title="FDAA API", version="0.2.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
 
 
-@app.get("/")
-async def root():
-    return {"name": "FDAA API", "version": "0.2.0", "docs": "/docs"}
+@app.route("/")
+def root():
+    return jsonify({"name": "FDAA API", "version": "0.2.0", "docs": "/api/workspaces"})
 
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+@app.route("/api/health")
+def health():
+    db = get_db()
+    return jsonify({"status": "healthy" if db else "no database"})
 
 
-@app.get("/api/workspaces")
-async def list_workspaces() -> List[WorkspaceInfo]:
+@app.route("/api/workspaces")
+def list_workspaces():
+    db = get_db()
+    if not db:
+        return jsonify({"error": "Database not configured"}), 500
+    
     workspaces = []
-    async for ws in get_db().workspaces.find({}, {"_id": 1, "name": 1, "files": 1}):
+    for ws in db.workspaces.find({}, {"_id": 1, "name": 1, "files": 1}):
         personas = set()
         files = ws.get("files", {})
         if isinstance(files, dict):
@@ -251,52 +219,80 @@ async def list_workspaces() -> List[WorkspaceInfo]:
                     parts = path.split("/")
                     if len(parts) >= 2:
                         personas.add(parts[1])
-        workspaces.append(WorkspaceInfo(
-            id=str(ws["_id"]),
-            name=ws.get("name", "Unnamed"),
-            personas=sorted(list(personas)),
-        ))
-    return workspaces
+        workspaces.append({
+            "id": str(ws["_id"]),
+            "name": ws.get("name", "Unnamed"),
+            "personas": sorted(list(personas)),
+        })
+    return jsonify(workspaces)
 
 
-@app.get("/api/workspaces/{workspace_id}")
-async def get_workspace_info(workspace_id: str):
-    workspace = await get_workspace(workspace_id)
+@app.route("/api/workspaces/<workspace_id>")
+def get_workspace_info(workspace_id):
+    workspace = get_workspace(workspace_id)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return workspace
-
-
-@app.post("/api/workspaces/{workspace_id}/chat", response_model=ChatResponse)
-async def chat(workspace_id: str, request: ChatRequest):
-    workspace = await get_workspace(workspace_id)
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        return jsonify({"error": "Workspace not found"}), 404
     
-    system_prompt = await assemble_prompt(workspace_id)
-    response = await call_llm(system_prompt, request.history or [], request.message, request.provider, request.model)
-    clean_response, memory_updated = await process_memory_updates(workspace_id, None, response)
-    
-    return ChatResponse(response=clean_response, workspace_id=workspace_id, memory_updated=memory_updated)
+    # Convert ObjectId to string for JSON
+    workspace["_id"] = str(workspace["_id"])
+    return jsonify(workspace)
 
 
-@app.post("/api/workspaces/{workspace_id}/personas/{persona}/chat", response_model=ChatResponse)
-async def chat_with_persona(workspace_id: str, persona: str, request: ChatRequest):
-    workspace = await get_workspace(workspace_id)
+@app.route("/api/workspaces/<workspace_id>/chat", methods=["POST"])
+def chat(workspace_id):
+    workspace = get_workspace(workspace_id)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        return jsonify({"error": "Workspace not found"}), 404
+    
+    data = request.get_json()
+    message = data.get("message")
+    provider = data.get("provider", "anthropic")
+    model = data.get("model")
+    history = data.get("history", [])
+    
+    if not message:
+        return jsonify({"error": "message required"}), 400
+    
+    system_prompt = assemble_prompt(workspace_id)
+    response = call_llm(system_prompt, history, message, provider, model)
+    clean_response, memory_updated = process_memory_updates(workspace_id, None, response)
+    
+    return jsonify({
+        "response": clean_response,
+        "workspace_id": workspace_id,
+        "memory_updated": memory_updated
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/chat", methods=["POST"])
+def chat_with_persona(workspace_id, persona):
+    workspace = get_workspace(workspace_id)
+    if not workspace:
+        return jsonify({"error": "Workspace not found"}), 404
     
     files = workspace.get("files", {})
     persona_prefix = f"personas/{persona}/"
     has_persona = any(path.startswith(persona_prefix) for path in (files.keys() if isinstance(files, dict) else []))
     
     if not has_persona:
-        raise HTTPException(status_code=404, detail=f"Persona '{persona}' not found")
+        return jsonify({"error": f"Persona '{persona}' not found"}), 404
     
-    system_prompt = await assemble_prompt(workspace_id, persona)
-    response = await call_llm(system_prompt, request.history or [], request.message, request.provider, request.model)
-    clean_response, memory_updated = await process_memory_updates(workspace_id, persona, response)
+    data = request.get_json()
+    message = data.get("message")
+    provider = data.get("provider", "anthropic")
+    model = data.get("model")
+    history = data.get("history", [])
     
-    return ChatResponse(response=clean_response, workspace_id=workspace_id, persona=persona, memory_updated=memory_updated)
-
-
+    if not message:
+        return jsonify({"error": "message required"}), 400
+    
+    system_prompt = assemble_prompt(workspace_id, persona)
+    response = call_llm(system_prompt, history, message, provider, model)
+    clean_response, memory_updated = process_memory_updates(workspace_id, persona, response)
+    
+    return jsonify({
+        "response": clean_response,
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "memory_updated": memory_updated
+    })
