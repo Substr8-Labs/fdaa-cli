@@ -9,15 +9,13 @@ from datetime import datetime, timezone
 client: Optional[AsyncIOMotorClient] = None
 db = None
 
-# Default connection string (override with MONGODB_URI env var)
-DEFAULT_URI = "mongodb+srv://rudiheydra_db_user:Ed0FeHVyJmq3SnNA@cluster0.ygfkd6s.mongodb.net/"
-
-
 async def connect_db():
     """Connect to MongoDB Atlas."""
     global client, db
     
-    mongodb_uri = os.environ.get("MONGODB_URI", DEFAULT_URI)
+    mongodb_uri = os.environ.get("MONGODB_URI")
+    if not mongodb_uri:
+        raise ValueError("MONGODB_URI environment variable required")
     
     client = AsyncIOMotorClient(mongodb_uri)
     db = client.fdaa

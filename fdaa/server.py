@@ -26,19 +26,10 @@ from . import database
 # Configuration
 # =============================================================================
 
-# Load Anthropic API key from secrets file if not in env
-def load_api_key():
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return
-    key_file = "/home/node/.openclaw/secrets/anthropic.env"
-    if os.path.exists(key_file):
-        with open(key_file) as f:
-            for line in f:
-                if line.startswith("ANTHROPIC_API_KEY="):
-                    os.environ["ANTHROPIC_API_KEY"] = line.split("=", 1)[1].strip()
-                    return
-
-load_api_key()
+# API keys should be set via environment variables:
+# - ANTHROPIC_API_KEY (for Anthropic/Claude)
+# - OPENAI_API_KEY (for OpenAI)
+# - MONGODB_URI (for MongoDB connection)
 
 
 # File injection order (FDAA spec)

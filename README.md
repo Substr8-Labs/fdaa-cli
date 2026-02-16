@@ -140,6 +140,41 @@ fdaa chat my-agent
 
 The agent's identity, personality, and memories all travel with it.
 
+## API Server (Optional)
+
+For multi-tenant or web deployments, FDAA includes a FastAPI server with MongoDB backend:
+
+```bash
+# Install server dependencies
+pip install fdaa[server]
+
+# Set environment variables
+export MONGODB_URI="mongodb+srv://..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Run server
+uvicorn fdaa.server:app --host 0.0.0.0 --port 8000
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/workspaces` | GET | List all workspaces |
+| `/workspaces/{id}` | GET | Get workspace |
+| `/workspaces/{id}/chat` | POST | Chat (no persona) |
+| `/workspaces/{id}/personas/{persona}/chat` | POST | Chat with persona |
+| `/workspaces/{id}/files` | GET | List files |
+| `/workspaces/{id}/files/{path}` | GET/PUT | Read/write file |
+
+### Chat Request
+
+```bash
+curl -X POST http://localhost:8000/workspaces/my-agent/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello!"}'
+```
+
 ## License
 
 MIT
