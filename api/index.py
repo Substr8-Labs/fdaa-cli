@@ -1689,3 +1689,76 @@ def api_verify_persona_chain(workspace_id, persona, filename):
     path = f"personas/{persona}/{filename}"
     result = verify_snapshot_chain(workspace_id, path)
     return jsonify(result)
+
+
+# =============================================================================
+# Waitlist API
+# =============================================================================
+
+@app.route("/api/waitlist", methods=["GET", "POST"])
+def api_waitlist():
+    """
+    Waitlist signup endpoint.
+    
+    POST: Add email to waitlist
+    GET: Get waitlist stats (admin)
+    """
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    if request.method == "POST":
+        data = request.get_json() or {}
+        email = data.get("email", "").lower().strip()
+        
+        if not email:
+            return jsonify({"error": "Email required"}), 400
+        
+        # Check if already exists
+        existing = db.waitlist.find_one({"email": email})
+        if existing:
+            return jsonify({
+                "success": True,
+                "message": "You're already on the list!",
+                "already_registered": True
+            })
+        
+        # Insert new signup
+        doc = {
+            "email": email,
+            "source": data.get("source", "unknown"),
+            "ip": data.get("ip", "unknown"),
+            "user_agent": data.get("userAgent", "unknown"),
+            "timestamp": datetime.now(timezone.utc),
+            "status": "pending",  # pending | invited | active
+            "invited_at": None,
+            "activated_at": None,
+        }
+        
+        db.waitlist.insert_one(doc)
+        
+        return jsonify({
+            "success": True,
+            "message": "You're on the list!",
+            "position": db.waitlist.count_documents({"status": "pending"})
+        })
+    
+    # GET - admin stats
+    total = db.waitlist.count_documents({})
+    pending = db.waitlist.count_documents({"status": "pending"})
+    invited = db.waitlist.count_documents({"status": "invited"})
+    active = db.waitlist.count_documents({"status": "active"})
+    
+    # Recent signups
+    recent = list(db.waitlist.find(
+        {},
+        {"email": 1, "source": 1, "timestamp": 1, "status": 1, "_id": 0}
+    ).sort("timestamp", -1).limit(10))
+    
+    return jsonify({
+        "total": total,
+        "pending": pending,
+        "invited": invited,
+        "active": active,
+        "recent": recent
+    })
