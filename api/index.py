@@ -199,8 +199,23 @@ def root():
 
 @app.route("/api/health")
 def health():
-    db = get_db()
-    return jsonify({"status": "healthy" if db else "no database"})
+    import traceback
+    try:
+        db = get_db()
+        if db:
+            # Test actual connection
+            db.command("ping")
+            return jsonify({"status": "healthy", "db": "connected"})
+        else:
+            return jsonify({"status": "no database", "mongodb_uri_set": bool(MONGODB_URI)})
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
+            "mongodb_uri_set": bool(MONGODB_URI),
+            "mongodb_uri_prefix": MONGODB_URI[:30] + "..." if MONGODB_URI else "not set"
+        }), 500
 
 
 @app.route("/api/workspaces")
