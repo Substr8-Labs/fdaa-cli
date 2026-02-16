@@ -103,8 +103,8 @@ def _default_model(provider: str) -> str:
     }.get(provider, "claude-sonnet-4-20250514")
 
 
-def _system_instructions() -> str:
-    return """## System Instructions
+def _system_instructions(skill_index: List[Dict] = None) -> str:
+    base = """## System Instructions
 
 You are an AI agent defined by the files above. Follow these rules:
 
@@ -125,10 +125,69 @@ When you learn something important, include a memory update block:
 - You CANNOT modify IDENTITY.md or SOUL.md
 - You CAN update MEMORY.md and CONTEXT.md
 """
+    
+    # Add skill index if present (Tier 1: Discovery)
+    if skill_index:
+        skills_section = "\n\n### Available Skills\n\n"
+        skills_section += "You have access to the following skills. Use them when relevant:\n\n"
+        for skill in skill_index:
+            verified = " ✓" if skill.get("verified") else ""
+            skills_section += f"- **{skill['name']}**{verified}: {skill['description']}\n"
+        skills_section += "\nTo use a skill, mention it by name and the system will provide full instructions.\n"
+        base += skills_section
+    
+    return base
 
 
-async def assemble_prompt(workspace_id: str, persona: Optional[str] = None) -> str:
-    """Assemble system prompt from workspace files."""
+def match_skills(user_message: str, skill_index: List[Dict]) -> List[str]:
+    """
+    Match user message to relevant skills (basic keyword matching).
+    
+    Returns list of skill_ids that should be activated.
+    TODO: Replace with embedding-based semantic matching.
+    """
+    if not user_message or not skill_index:
+        return []
+    
+    message_lower = user_message.lower()
+    matched = []
+    
+    for skill in skill_index:
+        description = skill.get("description", "").lower()
+        name = skill.get("name", "").lower()
+        
+        # Check if skill name or key words from description appear in message
+        # Extract trigger words (words in quotes or after "trigger on")
+        if name in message_lower:
+            matched.append(skill["skill_id"])
+            continue
+        
+        # Simple keyword extraction from description
+        # Look for quoted phrases or common trigger patterns
+        words = description.split()
+        for word in words:
+            # Skip common words
+            if word in {"use", "this", "when", "for", "the", "a", "an", "to", "on", "or"}:
+                continue
+            if len(word) > 3 and word in message_lower:
+                matched.append(skill["skill_id"])
+                break
+    
+    return matched
+
+
+async def assemble_prompt(
+    workspace_id: str, 
+    persona: Optional[str] = None,
+    user_message: Optional[str] = None
+) -> str:
+    """
+    Assemble system prompt from workspace files.
+    
+    Implements progressive disclosure:
+    - Tier 1: Always include skill index (name + description)
+    - Tier 2: Include full instructions for activated skills
+    """
     all_files = await database.get_files(workspace_id)
     
     # Filter files based on persona
@@ -159,8 +218,27 @@ async def assemble_prompt(workspace_id: str, persona: Optional[str] = None) -> s
         if filename not in INJECTION_ORDER:
             sections.append(f"## {filename}\n\n{content}")
     
-    # Add system instructions
-    sections.append(_system_instructions())
+    # Tier 1: Get skill index
+    skill_index = await database.get_skill_index(workspace_id)
+    
+    # Tier 2: Activate skills based on user message
+    activated_skills = []
+    if user_message and skill_index:
+        matched_ids = match_skills(user_message, skill_index)
+        for skill_id in matched_ids:
+            full_skill = await database.get_skill(workspace_id, skill_id)
+            if full_skill:
+                activated_skills.append(full_skill)
+    
+    # Add system instructions with skill index
+    sections.append(_system_instructions(skill_index))
+    
+    # Add activated skill instructions (Tier 2)
+    if activated_skills:
+        skills_section = "\n\n---\n\n## Activated Skills\n\n"
+        for skill in activated_skills:
+            skills_section += f"### {skill['name']}\n\n{skill['instructions']}\n\n"
+        sections.append(skills_section)
     
     return "\n\n---\n\n".join(sections)
 
@@ -247,8 +325,8 @@ async def process_memory_updates(
 
 app = FastAPI(
     title="FDAA API",
-    description="File-Driven Agent Architecture API Server",
-    version="0.2.0",
+    description="File-Driven Agent Architecture API Server with Progressive Skill Disclosure",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -265,7 +343,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"name": "FDAA API", "version": "0.2.0", "docs": "/docs"}
+    return {
+        "name": "FDAA API",
+        "version": "0.3.0",
+        "features": ["workspaces", "personas", "skills", "snapshotting"],
+        "docs": "/docs"
+    }
 
 
 @app.get("/health")
@@ -374,7 +457,8 @@ async def chat(workspace_id: str, request: ChatRequest):
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     
-    system_prompt = await assemble_prompt(workspace_id)
+    # Pass user message for skill activation
+    system_prompt = await assemble_prompt(workspace_id, user_message=request.message)
     response = await call_llm(
         system_prompt,
         request.history or [],
@@ -411,7 +495,8 @@ async def chat_with_persona(workspace_id: str, persona: str, request: ChatReques
     if not has_persona:
         raise HTTPException(status_code=404, detail=f"Persona '{persona}' not found")
     
-    system_prompt = await assemble_prompt(workspace_id, persona)
+    # Pass user message for skill activation
+    system_prompt = await assemble_prompt(workspace_id, persona, user_message=request.message)
     response = await call_llm(
         system_prompt,
         request.history or [],
@@ -432,6 +517,95 @@ async def chat_with_persona(workspace_id: str, persona: str, request: ChatReques
 
 
 # =============================================================================
+# Skills API (Progressive Disclosure)
+# =============================================================================
+
+@app.get("/workspaces/{workspace_id}/skills")
+async def list_skills(workspace_id: str, full: bool = False):
+    """
+    List skills in a workspace.
+    
+    Default: Returns Tier 1 index (name + description only) for prompt injection.
+    With full=true: Returns full metadata (no content).
+    """
+    if full:
+        skills = await database.list_skills(workspace_id)
+        return {"workspace_id": workspace_id, "skills": skills}
+    
+    # Tier 1: Index only (~30 tokens per skill)
+    index = await database.get_skill_index(workspace_id)
+    return {
+        "workspace_id": workspace_id,
+        "skill_count": len(index),
+        "skills": index
+    }
+
+
+@app.get("/workspaces/{workspace_id}/skills/{skill_id}")
+async def get_skill(workspace_id: str, skill_id: str):
+    """
+    Get full skill details (Tier 2).
+    
+    Includes instructions. Called when skill is activated.
+    """
+    skill = await database.get_skill(workspace_id, skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_id}' not found")
+    return skill
+
+
+@app.get("/workspaces/{workspace_id}/skills/{skill_id}/scripts/{script_name}")
+async def get_skill_script(workspace_id: str, skill_id: str, script_name: str):
+    """
+    Get a specific script from a skill (Tier 3).
+    
+    Called only when agent explicitly needs to execute a script.
+    """
+    content = await database.get_skill_script(workspace_id, skill_id, script_name)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"Script '{script_name}' not found")
+    return {"skill_id": skill_id, "script": script_name, "content": content}
+
+
+@app.get("/workspaces/{workspace_id}/skills/{skill_id}/references/{ref_name}")
+async def get_skill_reference(workspace_id: str, skill_id: str, ref_name: str):
+    """Get a specific reference document from a skill (Tier 3)."""
+    content = await database.get_skill_reference(workspace_id, skill_id, ref_name)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"Reference '{ref_name}' not found")
+    return {"skill_id": skill_id, "reference": ref_name, "content": content}
+
+
+@app.post("/workspaces/{workspace_id}/skills")
+async def install_skill(workspace_id: str, request: InstallSkillRequest):
+    """
+    Install a skill into a workspace.
+    
+    If skill_id already exists, it will be replaced (upgrade).
+    """
+    workspace = await database.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    
+    skill = await database.install_skill(workspace_id, request.model_dump())
+    return {
+        "status": "installed",
+        "workspace_id": workspace_id,
+        "skill_id": request.skill_id,
+        "version": skill.get("version", 1)
+    }
+
+
+@app.delete("/workspaces/{workspace_id}/skills/{skill_id}")
+async def uninstall_skill(workspace_id: str, skill_id: str):
+    """Uninstall a skill from a workspace."""
+    deleted = await database.delete_skill(workspace_id, skill_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_id}' not found")
+    return {"status": "uninstalled", "skill_id": skill_id}
+
+
+# =============================================================================
 # Snapshotting / History API
 # =============================================================================
 
@@ -448,6 +622,36 @@ class SnapshotInfo(BaseModel):
     parent_hash: str
     actor: str
     timestamp: datetime
+
+
+class InstallSkillRequest(BaseModel):
+    skill_id: str
+    name: Optional[str] = None
+    description: str
+    instructions: str
+    scripts: Optional[Dict[str, str]] = None
+    references: Optional[Dict[str, str]] = None
+    author: Optional[str] = None
+    version: Optional[int] = 1
+    signature: Optional[str] = None
+
+
+class SkillIndexItem(BaseModel):
+    skill_id: str
+    name: str
+    description: str
+    verified: bool = False
+
+
+class SkillInfo(BaseModel):
+    skill_id: str
+    name: str
+    description: str
+    instructions: str
+    author: Optional[str]
+    version: int
+    verified: bool
+    installed_at: datetime
 
 
 @app.get("/workspaces/{workspace_id}/history/{path:path}")
@@ -588,7 +792,8 @@ async def chat_simple(request: dict):
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     
-    system_prompt = await assemble_prompt(workspace_id, persona)
+    # Pass user message for skill activation
+    system_prompt = await assemble_prompt(workspace_id, persona, user_message=message)
     response = await call_llm(system_prompt, history, message)
     clean_response, memory_updated = await process_memory_updates(
         workspace_id, persona, response

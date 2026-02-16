@@ -262,10 +262,204 @@ def update_file_with_snapshot(workspace_id, path, content, actor=None):
 
 
 # =============================================================================
+# Skills System (Progressive Disclosure)
+# =============================================================================
+
+def install_skill(workspace_id, skill):
+    """
+    Install a skill into a workspace.
+    
+    Skill schema:
+    {
+        "skill_id": "security-reviewer",
+        "name": "Security Reviewer",
+        "description": "OWASP-aligned reviews. Trigger on 'security scan'.",
+        "instructions": "# Full SKILL.md content...",
+        "scripts": {"scan.py": "..."},       # Optional
+        "references": {"guide.md": "..."},   # Optional
+        "author": "substr8-labs",            # Optional
+        "version": 1,                        # Optional
+    }
+    """
+    db = get_db()
+    if db is None:
+        return None
+    
+    now = datetime.now(timezone.utc)
+    
+    doc = {
+        "workspace_id": workspace_id,
+        "skill_id": skill["skill_id"],
+        "name": skill.get("name", skill["skill_id"]),
+        "description": skill.get("description", ""),
+        "instructions": skill.get("instructions", ""),
+        "scripts": skill.get("scripts", {}),
+        "references": skill.get("references", {}),
+        "author": skill.get("author"),
+        "version": skill.get("version", 1),
+        "signature": skill.get("signature"),
+        "verified": skill.get("verified", False),
+        "trust_score": skill.get("trust_score"),
+        "installed_at": now,
+        "updated_at": now,
+    }
+    
+    # Upsert (replace if exists)
+    db.skills.replace_one(
+        {"workspace_id": workspace_id, "skill_id": skill["skill_id"]},
+        doc,
+        upsert=True
+    )
+    
+    return doc
+
+
+def get_skill_index(workspace_id):
+    """
+    Get Tier 1 skill index (name + description only).
+    Minimal payload for context-aware skill discovery.
+    """
+    db = get_db()
+    if db is None:
+        return []
+    
+    skills = list(db.skills.find(
+        {"workspace_id": workspace_id},
+        {"skill_id": 1, "name": 1, "description": 1, "verified": 1, "_id": 0}
+    ))
+    return skills
+
+
+def get_skill(workspace_id, skill_id):
+    """Get Tier 2 full skill (includes instructions)."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    skill = db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id}
+    )
+    if skill:
+        skill["_id"] = str(skill["_id"])
+    return skill
+
+
+def get_skill_script(workspace_id, skill_id, script_name):
+    """Get Tier 3 specific script content."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    skill = db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id},
+        {"scripts": 1}
+    )
+    if skill and skill.get("scripts"):
+        return skill["scripts"].get(script_name)
+    return None
+
+
+def get_skill_reference(workspace_id, skill_id, ref_name):
+    """Get a specific reference document from a skill."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    skill = db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id},
+        {"references": 1}
+    )
+    if skill and skill.get("references"):
+        return skill["references"].get(ref_name)
+    return None
+
+
+def delete_skill(workspace_id, skill_id):
+    """Uninstall a skill from a workspace."""
+    db = get_db()
+    if db is None:
+        return False
+    
+    result = db.skills.delete_one({
+        "workspace_id": workspace_id,
+        "skill_id": skill_id
+    })
+    return result.deleted_count > 0
+
+
+def list_skills(workspace_id):
+    """List all skills in a workspace (full metadata, no content)."""
+    db = get_db()
+    if db is None:
+        return []
+    
+    skills = list(db.skills.find(
+        {"workspace_id": workspace_id},
+        {"instructions": 0, "scripts": 0, "references": 0}
+    ))
+    for s in skills:
+        s["_id"] = str(s["_id"])
+    return skills
+
+
+def match_skills(user_message, skill_index):
+    """
+    Match user message to relevant skills (basic keyword matching).
+    Returns list of skill_ids that should be activated.
+    """
+    if not user_message or not skill_index:
+        return []
+    
+    message_lower = user_message.lower()
+    matched = []
+    
+    for skill in skill_index:
+        description = skill.get("description", "").lower()
+        name = skill.get("name", "").lower()
+        
+        # Check if skill name or key words from description appear
+        if name in message_lower:
+            matched.append(skill["skill_id"])
+            continue
+        
+        # Simple keyword extraction from description
+        words = description.split()
+        for word in words:
+            if word in {"use", "this", "when", "for", "the", "a", "an", "to", "on", "or"}:
+                continue
+            if len(word) > 3 and word in message_lower:
+                matched.append(skill["skill_id"])
+                break
+    
+    return matched
+
+
+# =============================================================================
 # Agent Logic
 # =============================================================================
 
-def assemble_prompt(workspace_id, persona=None):
+def format_skill_index(skill_index):
+    """Format skill index for system prompt injection."""
+    if not skill_index:
+        return ""
+    
+    lines = ["\n\n### Available Skills\n"]
+    lines.append("You have access to the following skills. Use them when relevant:\n")
+    for skill in skill_index:
+        verified = " ✓" if skill.get("verified") else ""
+        lines.append(f"- **{skill['name']}**{verified}: {skill['description']}")
+    lines.append("\nTo use a skill, mention it by name and the system will provide full instructions.\n")
+    return "\n".join(lines)
+
+
+def assemble_prompt(workspace_id, persona=None, user_message=None):
+    """
+    Assemble system prompt from workspace files.
+    
+    Implements progressive disclosure:
+    - Tier 1: Always include skill index (name + description)
+    - Tier 2: Include full instructions for activated skills
+    """
     all_files = get_files(workspace_id)
     
     files = {}
@@ -290,7 +484,20 @@ def assemble_prompt(workspace_id, persona=None):
         if filename not in INJECTION_ORDER:
             sections.append(f"## {filename}\n\n{content}")
     
-    sections.append("""## System Instructions
+    # Tier 1: Get skill index
+    skill_index = get_skill_index(workspace_id)
+    skill_section = format_skill_index(skill_index)
+    
+    # Tier 2: Activate skills based on user message
+    activated_skills = []
+    if user_message and skill_index:
+        matched_ids = match_skills(user_message, skill_index)
+        for skill_id in matched_ids:
+            full_skill = get_skill(workspace_id, skill_id)
+            if full_skill:
+                activated_skills.append(full_skill)
+    
+    system_instructions = """## System Instructions
 
 You are an AI agent defined by the files above. Follow these rules:
 
@@ -310,7 +517,21 @@ When you learn something important, include a memory update block:
 
 - You CANNOT modify IDENTITY.md or SOUL.md
 - You CAN update MEMORY.md and CONTEXT.md
-""")
+"""
+    
+    # Add skill index to system instructions
+    if skill_section:
+        system_instructions += skill_section
+    
+    sections.append(system_instructions)
+    
+    # Add activated skill instructions (Tier 2)
+    if activated_skills:
+        skills_content = "## Activated Skills\n\n"
+        for skill in activated_skills:
+            skills_content += f"### {skill['name']}\n\n{skill['instructions']}\n\n"
+        sections.append(skills_content)
+    
     return "\n\n---\n\n".join(sections)
 
 
@@ -386,7 +607,12 @@ app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return jsonify({"name": "FDAA API", "version": "0.2.0", "docs": "/api/workspaces"})
+    return jsonify({
+        "name": "FDAA API",
+        "version": "0.3.0",
+        "features": ["workspaces", "personas", "skills", "snapshotting"],
+        "docs": "/api/workspaces"
+    })
 
 
 @app.route("/api/health")
@@ -460,7 +686,8 @@ def chat(workspace_id):
     if not message:
         return jsonify({"error": "message required"}), 400
     
-    system_prompt = assemble_prompt(workspace_id)
+    # Pass user message for skill activation
+    system_prompt = assemble_prompt(workspace_id, user_message=message)
     response = call_llm(system_prompt, history, message, provider, model)
     clean_response, memory_updated = process_memory_updates(workspace_id, None, response)
     
@@ -560,7 +787,8 @@ def chat_with_persona(workspace_id, persona):
         if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
             return jsonify({"error": "OPENAI_API_KEY not configured"}), 500
         
-        system_prompt = assemble_prompt(workspace_id, persona)
+        # Pass user message for skill activation
+        system_prompt = assemble_prompt(workspace_id, persona, user_message=message)
         response = call_llm(system_prompt, history, message, provider, model)
         clean_response, memory_updated = process_memory_updates(workspace_id, persona, response)
         
@@ -576,6 +804,101 @@ def chat_with_persona(workspace_id, persona):
             "type": type(e).__name__,
             "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY"))
         }), 500
+
+
+# =============================================================================
+# Skills API (Progressive Disclosure)
+# =============================================================================
+
+@app.route("/api/workspaces/<workspace_id>/skills")
+def api_list_skills(workspace_id):
+    """
+    List skills in a workspace.
+    
+    Default: Returns Tier 1 index (name + description only).
+    With full=true: Returns full metadata (no content).
+    """
+    full = request.args.get("full", "false").lower() == "true"
+    
+    if full:
+        skills = list_skills(workspace_id)
+        return jsonify({"workspace_id": workspace_id, "skills": skills})
+    
+    # Tier 1: Index only (~30 tokens per skill)
+    index = get_skill_index(workspace_id)
+    return jsonify({
+        "workspace_id": workspace_id,
+        "skill_count": len(index),
+        "skills": index
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/skills/<skill_id>")
+def api_get_skill(workspace_id, skill_id):
+    """Get full skill details (Tier 2). Includes instructions."""
+    skill = get_skill(workspace_id, skill_id)
+    if not skill:
+        return jsonify({"error": f"Skill '{skill_id}' not found"}), 404
+    return jsonify(skill)
+
+
+@app.route("/api/workspaces/<workspace_id>/skills/<skill_id>/scripts/<script_name>")
+def api_get_skill_script(workspace_id, skill_id, script_name):
+    """Get a specific script from a skill (Tier 3)."""
+    content = get_skill_script(workspace_id, skill_id, script_name)
+    if content is None:
+        return jsonify({"error": f"Script '{script_name}' not found"}), 404
+    return jsonify({"skill_id": skill_id, "script": script_name, "content": content})
+
+
+@app.route("/api/workspaces/<workspace_id>/skills/<skill_id>/references/<ref_name>")
+def api_get_skill_reference(workspace_id, skill_id, ref_name):
+    """Get a specific reference document from a skill (Tier 3)."""
+    content = get_skill_reference(workspace_id, skill_id, ref_name)
+    if content is None:
+        return jsonify({"error": f"Reference '{ref_name}' not found"}), 404
+    return jsonify({"skill_id": skill_id, "reference": ref_name, "content": content})
+
+
+@app.route("/api/workspaces/<workspace_id>/skills", methods=["POST"])
+def api_install_skill(workspace_id):
+    """
+    Install a skill into a workspace.
+    If skill_id already exists, it will be replaced (upgrade).
+    """
+    workspace = get_workspace(workspace_id)
+    if workspace is None:
+        return jsonify({"error": "Workspace not found"}), 404
+    
+    data = request.get_json()
+    
+    if not data.get("skill_id"):
+        return jsonify({"error": "skill_id required"}), 400
+    if not data.get("description"):
+        return jsonify({"error": "description required"}), 400
+    if not data.get("instructions"):
+        return jsonify({"error": "instructions required"}), 400
+    
+    skill = install_skill(workspace_id, data)
+    
+    if skill is None:
+        return jsonify({"error": "Failed to install skill"}), 500
+    
+    return jsonify({
+        "status": "installed",
+        "workspace_id": workspace_id,
+        "skill_id": data["skill_id"],
+        "version": skill.get("version", 1)
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/skills/<skill_id>", methods=["DELETE"])
+def api_uninstall_skill(workspace_id, skill_id):
+    """Uninstall a skill from a workspace."""
+    deleted = delete_skill(workspace_id, skill_id)
+    if not deleted:
+        return jsonify({"error": f"Skill '{skill_id}' not found"}), 404
+    return jsonify({"status": "uninstalled", "skill_id": skill_id})
 
 
 # =============================================================================

@@ -344,3 +344,128 @@ async def update_file_with_snapshot(
     await update_file(workspace_id, path, content)
     
     return snapshot
+
+
+# =============================================================================
+# Skills System (Progressive Disclosure)
+# =============================================================================
+
+async def install_skill(workspace_id: str, skill: Dict) -> Dict:
+    """
+    Install a skill into a workspace.
+    
+    Skill schema:
+    {
+        "skill_id": "security-reviewer",
+        "name": "Security Reviewer",
+        "description": "OWASP-aligned reviews. Trigger on 'security scan'.",
+        "instructions": "# Full SKILL.md content...",
+        "scripts": {"scan.py": "..."},       # Optional
+        "references": {"guide.md": "..."},   # Optional
+        "author": "substr8-labs",            # Optional
+        "version": 1,                        # Optional
+        "signature": "ed25519:...",          # Optional
+    }
+    """
+    now = datetime.now(timezone.utc)
+    
+    doc = {
+        "workspace_id": workspace_id,
+        "skill_id": skill["skill_id"],
+        "name": skill.get("name", skill["skill_id"]),
+        "description": skill.get("description", ""),
+        "instructions": skill.get("instructions", ""),
+        "scripts": skill.get("scripts", {}),
+        "references": skill.get("references", {}),
+        "author": skill.get("author"),
+        "version": skill.get("version", 1),
+        "signature": skill.get("signature"),
+        "verified": skill.get("verified", False),
+        "trust_score": skill.get("trust_score"),
+        "installed_at": now,
+        "updated_at": now,
+    }
+    
+    # Upsert (replace if exists)
+    await db.skills.replace_one(
+        {"workspace_id": workspace_id, "skill_id": skill["skill_id"]},
+        doc,
+        upsert=True
+    )
+    
+    return doc
+
+
+async def get_skill_index(workspace_id: str) -> List[Dict]:
+    """
+    Get Tier 1 skill index (name + description only).
+    
+    Minimal payload for context-aware skill discovery.
+    ~30-50 tokens per skill.
+    """
+    cursor = db.skills.find(
+        {"workspace_id": workspace_id},
+        {"skill_id": 1, "name": 1, "description": 1, "verified": 1, "_id": 0}
+    )
+    return await cursor.to_list(length=500)
+
+
+async def get_skill(workspace_id: str, skill_id: str) -> Optional[Dict]:
+    """
+    Get Tier 2 full skill (includes instructions).
+    
+    Called when skill is activated based on user query.
+    """
+    skill = await db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id}
+    )
+    if skill:
+        skill["_id"] = str(skill["_id"])
+    return skill
+
+
+async def get_skill_script(workspace_id: str, skill_id: str, script_name: str) -> Optional[str]:
+    """
+    Get Tier 3 specific script content.
+    
+    Called only when agent explicitly needs a script.
+    """
+    skill = await db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id},
+        {"scripts": 1}
+    )
+    if skill and skill.get("scripts"):
+        return skill["scripts"].get(script_name)
+    return None
+
+
+async def get_skill_reference(workspace_id: str, skill_id: str, ref_name: str) -> Optional[str]:
+    """Get a specific reference document from a skill."""
+    skill = await db.skills.find_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id},
+        {"references": 1}
+    )
+    if skill and skill.get("references"):
+        return skill["references"].get(ref_name)
+    return None
+
+
+async def delete_skill(workspace_id: str, skill_id: str) -> bool:
+    """Uninstall a skill from a workspace."""
+    result = await db.skills.delete_one({
+        "workspace_id": workspace_id,
+        "skill_id": skill_id
+    })
+    return result.deleted_count > 0
+
+
+async def list_skills(workspace_id: str) -> List[Dict]:
+    """List all skills in a workspace (full metadata, no content)."""
+    cursor = db.skills.find(
+        {"workspace_id": workspace_id},
+        {"instructions": 0, "scripts": 0, "references": 0}
+    )
+    skills = await cursor.to_list(length=500)
+    for s in skills:
+        s["_id"] = str(s["_id"])
+    return skills
