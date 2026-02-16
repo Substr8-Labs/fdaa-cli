@@ -387,6 +387,169 @@ def delete_skill(workspace_id, skill_id):
     return result.deleted_count > 0
 
 
+def update_skill_permissions(workspace_id, skill_id, permissions):
+    """Update permissions for a skill."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    result = db.skills.update_one(
+        {"workspace_id": workspace_id, "skill_id": skill_id},
+        {"$set": {"permissions": permissions, "updated_at": datetime.now(timezone.utc)}}
+    )
+    
+    if result.matched_count == 0:
+        return None
+    
+    return get_skill(workspace_id, skill_id)
+
+
+# =============================================================================
+# Persona Permissions
+# =============================================================================
+
+def get_persona_permissions(workspace_id, persona):
+    """Get permissions for a persona."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    perms = db.persona_permissions.find_one({
+        "workspace_id": workspace_id,
+        "persona": persona
+    })
+    
+    if perms:
+        perms["_id"] = str(perms["_id"])
+    
+    return perms
+
+
+def set_persona_permissions(workspace_id, persona, permissions):
+    """Set permissions for a persona."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    now = datetime.now(timezone.utc)
+    
+    doc = {
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "skill_access": permissions.get("skill_access", {"mode": "allowlist", "skills": [], "categories": []}),
+        "connector_access": permissions.get("connector_access", {"allowed": [], "blocked": []}),
+        "limits": permissions.get("limits", {"max_skills_per_message": 5, "max_chain_depth": 3}),
+        "updated_at": now
+    }
+    
+    db.persona_permissions.update_one(
+        {"workspace_id": workspace_id, "persona": persona},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True
+    )
+    
+    return get_persona_permissions(workspace_id, persona)
+
+
+def check_skill_access(skill, persona, persona_perms):
+    """
+    Check if a persona can use a skill.
+    Returns {"allowed": bool, "reason": str}
+    """
+    skill_perms = skill.get("permissions", {})
+    
+    # Check skill's invoke_personas
+    allowed_personas = skill_perms.get("invoke_personas", ["*"])
+    if "*" not in allowed_personas and persona not in allowed_personas:
+        return {"allowed": False, "reason": f"Skill not available to persona '{persona}'"}
+    
+    # If no persona permissions set, allow by default
+    if not persona_perms:
+        return {"allowed": True, "reason": "No restrictions"}
+    
+    # Check persona's skill access mode
+    skill_access = persona_perms.get("skill_access", {})
+    mode = skill_access.get("mode", "allowlist")
+    skill_list = skill_access.get("skills", [])
+    categories = skill_access.get("categories", [])
+    
+    skill_id = skill.get("skill_id")
+    skill_category = skill.get("category", "general")
+    
+    if mode == "allowlist":
+        # If allowlist is empty, allow all (no restrictions configured)
+        if not skill_list and not categories:
+            return {"allowed": True, "reason": "No allowlist restrictions"}
+        
+        # Check if skill is in allowlist
+        if skill_id in skill_list:
+            return {"allowed": True, "reason": "Skill in allowlist"}
+        
+        # Check if skill category is allowed
+        if skill_category in categories:
+            return {"allowed": True, "reason": f"Category '{skill_category}' allowed"}
+        
+        return {"allowed": False, "reason": "Skill not in persona's allowlist"}
+    
+    else:  # blocklist mode
+        # Check if skill is blocked
+        if skill_id in skill_list:
+            return {"allowed": False, "reason": "Skill is blocked for this persona"}
+        
+        # Check if category is blocked
+        blocked_categories = persona_perms.get("skill_access", {}).get("blocked_categories", [])
+        if skill_category in blocked_categories:
+            return {"allowed": False, "reason": f"Category '{skill_category}' is blocked"}
+        
+        return {"allowed": True, "reason": "Skill not in blocklist"}
+
+
+# =============================================================================
+# Skill Execution Audit
+# =============================================================================
+
+def log_skill_activation(workspace_id, skill_id, persona, trigger_message, status="activated"):
+    """Log a skill activation for audit."""
+    db = get_db()
+    if db is None:
+        return None
+    
+    doc = {
+        "workspace_id": workspace_id,
+        "skill_id": skill_id,
+        "persona": persona,
+        "triggered_by": "message",
+        "trigger_message": trigger_message[:500] if trigger_message else None,  # Truncate
+        "status": status,
+        "timestamp": datetime.now(timezone.utc)
+    }
+    
+    result = db.skill_executions.insert_one(doc)
+    return str(result.inserted_id)
+
+
+def get_skill_audit(workspace_id, skill_id=None, persona=None, limit=100):
+    """Query skill execution audit log."""
+    db = get_db()
+    if db is None:
+        return []
+    
+    query = {"workspace_id": workspace_id}
+    if skill_id:
+        query["skill_id"] = skill_id
+    if persona:
+        query["persona"] = persona
+    
+    cursor = db.skill_executions.find(query).sort("timestamp", -1).limit(limit)
+    
+    results = []
+    for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        results.append(doc)
+    
+    return results
+
+
 def list_skills(workspace_id):
     """List all skills in a workspace (full metadata, no content)."""
     db = get_db()
@@ -432,6 +595,60 @@ def match_skills(user_message, skill_index):
                 break
     
     return matched
+
+
+def activate_skills_with_permissions(workspace_id, persona, user_message):
+    """
+    Full skill activation with permission checks.
+    Returns {"activated": [...], "blocked": [...]}
+    """
+    # Get skill index
+    skill_index = get_skill_index(workspace_id)
+    if not skill_index:
+        return {"activated": [], "blocked": []}
+    
+    # Match skills to message
+    matched_ids = match_skills(user_message, skill_index)
+    if not matched_ids:
+        return {"activated": [], "blocked": []}
+    
+    # Get persona permissions
+    persona_perms = get_persona_permissions(workspace_id, persona)
+    
+    activated = []
+    blocked = []
+    
+    for skill_id in matched_ids:
+        skill = get_skill(workspace_id, skill_id)
+        if not skill:
+            continue
+        
+        # Check permission
+        access = check_skill_access(skill, persona, persona_perms)
+        
+        if not access["allowed"]:
+            blocked.append({
+                "skill_id": skill_id,
+                "name": skill.get("name", skill_id),
+                "reason": access["reason"]
+            })
+            # Log blocked activation
+            log_skill_activation(workspace_id, skill_id, persona, user_message, status="blocked")
+            continue
+        
+        # Skill is activated
+        activated.append({
+            "skill_id": skill_id,
+            "name": skill.get("name", skill_id),
+            "description": skill.get("description", ""),
+            "type": skill.get("type", "knowledge"),
+            "instructions": skill.get("instructions", "")
+        })
+        
+        # Log successful activation
+        log_skill_activation(workspace_id, skill_id, persona, user_message, status="activated")
+    
+    return {"activated": activated, "blocked": blocked}
 
 
 # =============================================================================
@@ -609,8 +826,8 @@ app = Flask(__name__)
 def root():
     return jsonify({
         "name": "FDAA API",
-        "version": "0.3.0",
-        "features": ["workspaces", "personas", "skills", "snapshotting"],
+        "version": "0.4.0",
+        "features": ["workspaces", "personas", "skills", "snapshotting", "permissions", "audit"],
         "docs": "/api/workspaces"
     })
 
@@ -709,6 +926,7 @@ def get_persona_context(workspace_id, persona):
     Returns:
     - system_prompt: Assembled prompt with skill index
     - activated_skills: List of skills triggered by message (if provided)
+    - blocked_skills: Skills that matched but were blocked by permissions
     - available_skills: Total skills available
     """
     try:
@@ -731,24 +949,26 @@ def get_persona_context(workspace_id, persona):
         
         # Get skill info for response
         skill_index = get_skill_index(workspace_id)
+        
+        # Use permission-aware activation if message provided
         activated_skills = []
+        blocked_skills = []
         
         if user_message and skill_index:
-            matched_ids = match_skills(user_message, skill_index)
-            for skill in skill_index:
-                if skill["skill_id"] in matched_ids:
-                    activated_skills.append({
-                        "skill_id": skill["skill_id"],
-                        "name": skill["name"],
-                        "description": skill["description"]
-                    })
+            activation = activate_skills_with_permissions(workspace_id, persona, user_message)
+            activated_skills = [
+                {"skill_id": s["skill_id"], "name": s["name"], "description": s["description"]}
+                for s in activation["activated"]
+            ]
+            blocked_skills = activation["blocked"]
         
         return jsonify({
             "workspace_id": workspace_id,
             "persona": persona,
             "system_prompt": system_prompt,
             "available_skills": len(skill_index),
-            "activated_skills": activated_skills
+            "activated_skills": activated_skills,
+            "blocked_skills": blocked_skills
         })
     except Exception as e:
         return jsonify({"error": str(e), "type": type(e).__name__}), 500
@@ -929,6 +1149,122 @@ def api_uninstall_skill(workspace_id, skill_id):
     if not deleted:
         return jsonify({"error": f"Skill '{skill_id}' not found"}), 404
     return jsonify({"status": "uninstalled", "skill_id": skill_id})
+
+
+# =============================================================================
+# Permissions API
+# =============================================================================
+
+@app.route("/api/workspaces/<workspace_id>/skills/<skill_id>/permissions", methods=["GET", "PUT"])
+def api_skill_permissions(workspace_id, skill_id):
+    """Get or update skill permissions."""
+    skill = get_skill(workspace_id, skill_id)
+    if not skill:
+        return jsonify({"error": f"Skill '{skill_id}' not found"}), 404
+    
+    if request.method == "GET":
+        return jsonify({
+            "workspace_id": workspace_id,
+            "skill_id": skill_id,
+            "permissions": skill.get("permissions", {})
+        })
+    
+    # PUT - update permissions
+    data = request.get_json()
+    permissions = data.get("permissions", {})
+    
+    # Validate permissions structure
+    valid_keys = {"invoke_personas", "invoke_roles", "scopes", "rate_limit", "approval", "install_roles"}
+    for key in permissions.keys():
+        if key not in valid_keys:
+            return jsonify({"error": f"Invalid permission key: {key}"}), 400
+    
+    updated = update_skill_permissions(workspace_id, skill_id, permissions)
+    if not updated:
+        return jsonify({"error": "Failed to update permissions"}), 500
+    
+    return jsonify({
+        "status": "updated",
+        "workspace_id": workspace_id,
+        "skill_id": skill_id,
+        "permissions": updated.get("permissions", {})
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/personas/<persona>/permissions", methods=["GET", "PUT"])
+def api_persona_permissions(workspace_id, persona):
+    """Get or update persona permissions."""
+    workspace = get_workspace(workspace_id)
+    if workspace is None:
+        return jsonify({"error": "Workspace not found"}), 404
+    
+    if request.method == "GET":
+        perms = get_persona_permissions(workspace_id, persona)
+        return jsonify({
+            "workspace_id": workspace_id,
+            "persona": persona,
+            "permissions": perms or {"skill_access": {"mode": "allowlist", "skills": [], "categories": []}}
+        })
+    
+    # PUT - update permissions
+    data = request.get_json()
+    perms = set_persona_permissions(workspace_id, persona, data)
+    
+    return jsonify({
+        "status": "updated",
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "permissions": perms
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/check-access", methods=["POST"])
+def api_check_access(workspace_id):
+    """
+    Check if a persona can invoke a skill.
+    Body: {"persona": "ada", "skill_id": "send-email"}
+    """
+    data = request.get_json()
+    persona = data.get("persona")
+    skill_id = data.get("skill_id")
+    
+    if not persona or not skill_id:
+        return jsonify({"error": "persona and skill_id required"}), 400
+    
+    skill = get_skill(workspace_id, skill_id)
+    if not skill:
+        return jsonify({"error": f"Skill '{skill_id}' not found"}), 404
+    
+    persona_perms = get_persona_permissions(workspace_id, persona)
+    access = check_skill_access(skill, persona, persona_perms)
+    
+    return jsonify({
+        "workspace_id": workspace_id,
+        "persona": persona,
+        "skill_id": skill_id,
+        "allowed": access["allowed"],
+        "reason": access["reason"]
+    })
+
+
+@app.route("/api/workspaces/<workspace_id>/skills/audit")
+def api_skill_audit(workspace_id):
+    """
+    Query skill execution audit log.
+    Params: ?skill_id=&persona=&limit=
+    """
+    skill_id = request.args.get("skill_id")
+    persona = request.args.get("persona")
+    limit = request.args.get("limit", 100, type=int)
+    
+    audit = get_skill_audit(workspace_id, skill_id, persona, limit)
+    
+    return jsonify({
+        "workspace_id": workspace_id,
+        "filters": {"skill_id": skill_id, "persona": persona},
+        "count": len(audit),
+        "executions": audit
+    })
 
 
 # =============================================================================
