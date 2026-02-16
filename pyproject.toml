@@ -1,6 +1,6 @@
 [project]
 name = "fdaa"
-version = "0.1.0"
+version = "0.2.0"
 description = "File-Driven Agent Architecture - Reference Implementation"
 authors = [{name = "Substr8 Labs", email = "hello@substr8labs.com"}]
 readme = "README.md"
@@ -11,6 +11,13 @@ dependencies = [
     "anthropic>=0.18.0",
     "click>=8.0.0",
     "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "motor>=3.0.0",
 ]
 
 [project.scripts]

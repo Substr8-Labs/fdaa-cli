@@ -1,97 +1,96 @@
 #!/usr/bin/env python3
 """
-FDAA API Server - MongoDB Backend
+FDAA API Server
 
-FastAPI service that loads agent workspaces from MongoDB,
-assembles prompts, calls LLMs, and persists memory updates.
+FastAPI service with MongoDB backend for file-driven agents.
+Loads workspaces, assembles prompts, calls LLMs, persists memory.
 
 Usage:
     cd fdaa-cli && source .venv/bin/activate
-    uvicorn fdaa.server:app --reload --port 8000
+    uvicorn fdaa.server:app --host 0.0.0.0 --port 8000
 """
 
 import os
 import re
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
+from typing import Optional, Dict, List
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pymongo import MongoClient
+
+from . import database
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb+srv://rudiheydra_db_user:Ed0FeHVyJmq3SnNA@cluster0.ygfkd6s.mongodb.net/"
-)
-DATABASE_NAME = "fdaa"
-
-# Load Anthropic API key
-def load_anthropic_key():
+# Load Anthropic API key from secrets file if not in env
+def load_api_key():
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
     key_file = "/home/node/.openclaw/secrets/anthropic.env"
     if os.path.exists(key_file):
         with open(key_file) as f:
             for line in f:
                 if line.startswith("ANTHROPIC_API_KEY="):
                     os.environ["ANTHROPIC_API_KEY"] = line.split("=", 1)[1].strip()
-                    return True
-    return False
+                    return
 
-load_anthropic_key()
+load_api_key()
+
 
 # File injection order (FDAA spec)
 INJECTION_ORDER = [
     "IDENTITY.md",
-    "SOUL.md", 
+    "SOUL.md",
     "CONTEXT.md",
     "MEMORY.md",
     "TOOLS.md",
 ]
 
-# W^X Policy
+# W^X Policy: Files the agent CAN write to
 WRITABLE_FILES = {"MEMORY.md", "CONTEXT.md"}
 
 
 # =============================================================================
-# Database
+# Lifespan
 # =============================================================================
-
-client: MongoClient = None
-db = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle."""
-    global client, db
-    client = MongoClient(MONGODB_URI)
-    db = client[DATABASE_NAME]
-    print(f"Connected to MongoDB: {DATABASE_NAME}")
+    """Startup and shutdown events."""
+    await database.connect_db()
     yield
-    client.close()
-    print("MongoDB connection closed")
+    await database.close_db()
 
 
 # =============================================================================
 # Models
 # =============================================================================
 
+class CreateWorkspaceRequest(BaseModel):
+    name: str
+    files: Dict[str, str]
+
+
+class UpdateFileRequest(BaseModel):
+    content: str
+
+
 class ChatRequest(BaseModel):
-    workspace_id: str
-    persona: str  # e.g., "ada", "grace"
     message: str
+    provider: str = "anthropic"
+    model: Optional[str] = None
     history: Optional[List[Dict[str, str]]] = None
 
 
 class ChatResponse(BaseModel):
     response: str
-    memory_updated: bool
-    persona: str
+    workspace_id: str
+    persona: Optional[str] = None
+    memory_updated: bool = False
 
 
 class WorkspaceInfo(BaseModel):
@@ -103,166 +102,157 @@ class WorkspaceInfo(BaseModel):
 
 
 # =============================================================================
-# Core Logic
+# Agent Logic
 # =============================================================================
 
-def get_workspace(workspace_id: str) -> Dict:
-    """Load workspace from MongoDB."""
-    # Try by _id first (string), then by name
-    workspace = db.workspaces.find_one({"_id": workspace_id})
-    if not workspace:
-        workspace = db.workspaces.find_one({"name": workspace_id})
-    
-    if not workspace:
-        raise HTTPException(status_code=404, detail=f"Workspace not found: {workspace_id}")
-    
-    return workspace
+def _default_model(provider: str) -> str:
+    return {
+        "openai": "gpt-4o",
+        "anthropic": "claude-sonnet-4-20250514",
+    }.get(provider, "claude-sonnet-4-20250514")
 
 
-def get_file_content(workspace: Dict, path: str) -> Optional[str]:
-    """Get file content from workspace."""
-    files = workspace.get("files", {})
-    
-    # Handle dict structure: {path: {content: "..."}}
-    if isinstance(files, dict):
-        file_data = files.get(path)
-        if file_data and isinstance(file_data, dict):
-            return file_data.get("content", "")
-        return None
-    
-    # Handle list structure (legacy)
-    for f in files:
-        if isinstance(f, dict) and f.get("path") == path:
-            return f.get("content", "")
-    
-    return None
-
-
-def assemble_prompt(workspace: Dict, persona: str) -> str:
-    """Assemble system prompt for a persona."""
-    sections = []
-    
-    # Shared context first
-    shared_context = get_file_content(workspace, "CONTEXT.md")
-    if shared_context:
-        sections.append(f"## Shared Context\n\n{shared_context}")
-    
-    # Persona files in injection order
-    for filename in INJECTION_ORDER:
-        path = f"personas/{persona}/{filename}"
-        content = get_file_content(workspace, path)
-        if content:
-            sections.append(f"## {filename}\n\n{content}")
-    
-    # System instructions
-    sections.append("""## System Instructions
+def _system_instructions() -> str:
+    return """## System Instructions
 
 You are an AI agent defined by the files above. Follow these rules:
 
 1. **Stay in character** as defined by IDENTITY.md and SOUL.md
-2. **Remember context** from MEMORY.md and CONTEXT.md  
+2. **Remember context** from MEMORY.md and CONTEXT.md
 3. **Use capabilities** listed in TOOLS.md (if present)
 
 ### Memory Updates
 
-When you learn something important that should persist, include a memory update block:
+When you learn something important, include a memory update block:
 
 ```memory:MEMORY.md
 [Your updated memory content here]
 ```
 
-This will be saved to your MEMORY.md file. Only include what's worth remembering long-term.
-
 ### Boundaries
 
-- You CANNOT modify IDENTITY.md or SOUL.md (these define who you are)
+- You CANNOT modify IDENTITY.md or SOUL.md
 - You CAN update MEMORY.md and CONTEXT.md
-- Be helpful, stay in character, and remember what matters.
-""")
+"""
+
+
+async def assemble_prompt(workspace_id: str, persona: Optional[str] = None) -> str:
+    """Assemble system prompt from workspace files."""
+    all_files = await database.get_files(workspace_id)
+    
+    # Filter files based on persona
+    files = {}
+    if persona:
+        persona_prefix = f"personas/{persona}/"
+        # Include shared files (no persona prefix)
+        for path, content in all_files.items():
+            if not path.startswith("personas/"):
+                files[path] = content
+        # Include persona-specific files (strip prefix)
+        for path, content in all_files.items():
+            if path.startswith(persona_prefix):
+                filename = path.replace(persona_prefix, "")
+                files[filename] = content
+    else:
+        files = all_files
+    
+    sections = []
+    
+    # Add files in defined order
+    for filename in INJECTION_ORDER:
+        if filename in files:
+            sections.append(f"## {filename}\n\n{files[filename]}")
+    
+    # Add any additional files
+    for filename, content in sorted(files.items()):
+        if filename not in INJECTION_ORDER:
+            sections.append(f"## {filename}\n\n{content}")
+    
+    # Add system instructions
+    sections.append(_system_instructions())
     
     return "\n\n---\n\n".join(sections)
 
 
-def call_anthropic(system_prompt: str, history: List[Dict], message: str) -> str:
-    """Call Anthropic API."""
-    from anthropic import Anthropic
-    
-    client = Anthropic()
+async def call_llm(
+    system_prompt: str,
+    history: List[Dict[str, str]],
+    message: str,
+    provider: str = "anthropic",
+    model: Optional[str] = None
+) -> str:
+    """Call LLM with assembled prompt."""
+    model = model or _default_model(provider)
     
     messages = list(history) if history else []
     messages.append({"role": "user", "content": message})
     
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=system_prompt,
-        messages=messages,
-    )
+    if provider == "openai":
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI()
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
+        )
+        return response.choices[0].message.content
     
-    return response.content[0].text
+    elif provider == "anthropic":
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic()
+        response = await client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+        )
+        return response.content[0].text
+    
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 
-def process_memory_updates(workspace: Dict, persona: str, response: str) -> tuple[str, bool]:
+async def process_memory_updates(
+    workspace_id: str,
+    persona: Optional[str],
+    response: str
+) -> tuple[str, bool]:
     """Extract memory blocks and persist to MongoDB."""
     pattern = r"```memory:(\S+)\n(.*?)```"
     memory_updated = False
     
-    def apply_update(match):
-        nonlocal memory_updated
+    matches = list(re.finditer(pattern, response, flags=re.DOTALL))
+    clean_response = response
+    
+    for match in reversed(matches):
         filename = match.group(1)
         content = match.group(2).strip()
         
-        # Enforce W^X policy
         if filename not in WRITABLE_FILES:
-            return f"\n\n*[Blocked: Cannot write to {filename} - W^X policy]*\n\n"
+            replacement = f"\n\n*[Blocked: Cannot write to {filename}]*\n\n"
+        else:
+            # Determine full path
+            if persona:
+                path = f"personas/{persona}/{filename}"
+            else:
+                path = filename
+            
+            await database.update_file(workspace_id, path, content)
+            memory_updated = True
+            replacement = f"\n\n*[Memory updated: {filename}]*\n\n"
         
-        # Update in MongoDB
-        path = f"personas/{persona}/{filename}"
-        update_file_in_db(workspace["_id"], path, content)
-        memory_updated = True
-        
-        return f"\n\n*[Memory updated: {filename}]*\n\n"
+        clean_response = clean_response[:match.start()] + replacement + clean_response[match.end():]
     
-    clean_response = re.sub(pattern, apply_update, response, flags=re.DOTALL)
     return clean_response.strip(), memory_updated
 
 
-def update_file_in_db(workspace_id: str, path: str, content: str):
-    """Update a file in MongoDB workspace."""
-    # Read-modify-write since paths contain slashes (can't use dot notation)
-    workspace = db.workspaces.find_one({"_id": workspace_id})
-    if not workspace:
-        return
-    
-    files = workspace.get("files", {})
-    if not isinstance(files, dict):
-        files = {}
-    
-    # Update the file
-    if path not in files:
-        files[path] = {}
-    files[path]["content"] = content
-    
-    # Write back
-    db.workspaces.update_one(
-        {"_id": workspace_id},
-        {
-            "$set": {
-                "files": files,
-                "updated_at": datetime.now(timezone.utc)
-            }
-        }
-    )
-
-
 # =============================================================================
-# API Routes
+# FastAPI App
 # =============================================================================
 
 app = FastAPI(
     title="FDAA API",
-    description="File-Driven Agent Architecture - MongoDB Backend",
-    version="0.1.0",
+    description="File-Driven Agent Architecture API Server",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -275,27 +265,36 @@ app.add_middleware(
 )
 
 
+# Health & Info
+
 @app.get("/")
 async def root():
-    """Health check."""
-    return {"status": "ok", "service": "fdaa-api", "database": DATABASE_NAME}
+    return {"name": "FDAA API", "version": "0.2.0", "docs": "/docs"}
 
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+# Workspace CRUD
 
 @app.get("/workspaces")
 async def list_workspaces() -> List[WorkspaceInfo]:
     """List all workspaces."""
     workspaces = []
-    for ws in db.workspaces.find():
-        # Extract persona names from file paths
+    for ws in await database.list_workspaces():
+        # Get full workspace to extract personas
+        full_ws = await database.get_workspace(ws["_id"])
         personas = set()
-        files = ws.get("files", {})
-        
-        if isinstance(files, dict):
-            for path in files.keys():
-                if path.startswith("personas/"):
-                    parts = path.split("/")
-                    if len(parts) >= 2:
-                        personas.add(parts[1])
+        if full_ws:
+            files = full_ws.get("files", {})
+            if isinstance(files, dict):
+                for path in files.keys():
+                    if path.startswith("personas/"):
+                        parts = path.split("/")
+                        if len(parts) >= 2:
+                            personas.add(parts[1])
         
         workspaces.append(WorkspaceInfo(
             id=str(ws["_id"]),
@@ -309,68 +308,161 @@ async def list_workspaces() -> List[WorkspaceInfo]:
 
 
 @app.get("/workspaces/{workspace_id}")
-async def get_workspace_info(workspace_id: str) -> WorkspaceInfo:
-    """Get workspace details."""
-    ws = get_workspace(workspace_id)
+async def get_workspace(workspace_id: str):
+    """Get a workspace."""
+    workspace = await database.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return workspace
+
+
+@app.post("/workspaces/{workspace_id}")
+async def create_workspace(workspace_id: str, request: CreateWorkspaceRequest):
+    """Create a new workspace."""
+    existing = await database.get_workspace(workspace_id)
+    if existing:
+        raise HTTPException(status_code=409, detail="Workspace already exists")
     
-    personas = set()
-    files = ws.get("files", {})
-    if isinstance(files, dict):
-        for path in files.keys():
-            if path.startswith("personas/"):
-                parts = path.split("/")
-                if len(parts) >= 2:
-                    personas.add(parts[1])
-    
-    return WorkspaceInfo(
-        id=str(ws["_id"]),
-        name=ws.get("name", "Unnamed"),
-        personas=sorted(list(personas)),
-        created_at=ws.get("created_at", datetime.now(timezone.utc)),
-        updated_at=ws.get("updated_at", datetime.now(timezone.utc)),
+    await database.create_workspace(
+        workspace_id=workspace_id,
+        name=request.name,
+        files=request.files
     )
+    return {"status": "created", "workspace_id": workspace_id}
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
-    """Chat with a persona."""
-    workspace = get_workspace(request.workspace_id)
+@app.delete("/workspaces/{workspace_id}")
+async def delete_workspace(workspace_id: str):
+    """Delete a workspace."""
+    deleted = await database.delete_workspace(workspace_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return {"status": "deleted"}
+
+
+# File Operations
+
+@app.get("/workspaces/{workspace_id}/files")
+async def list_files(workspace_id: str):
+    """List files in a workspace."""
+    files = await database.get_files(workspace_id)
+    if not files:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return {"files": list(files.keys())}
+
+
+@app.get("/workspaces/{workspace_id}/files/{path:path}")
+async def get_file(workspace_id: str, path: str):
+    """Get a file from a workspace."""
+    content = await database.get_file(workspace_id, path)
+    if content is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"path": path, "content": content}
+
+
+@app.put("/workspaces/{workspace_id}/files/{path:path}")
+async def update_file(workspace_id: str, path: str, request: UpdateFileRequest):
+    """Update a file in a workspace."""
+    updated = await database.update_file(workspace_id, path, request.content)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return {"status": "updated", "path": path}
+
+
+# Chat
+
+@app.post("/workspaces/{workspace_id}/chat", response_model=ChatResponse)
+async def chat(workspace_id: str, request: ChatRequest):
+    """Chat with an agent (no persona - uses root files)."""
+    workspace = await database.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
     
-    # Assemble prompt
-    system_prompt = assemble_prompt(workspace, request.persona)
-    
-    # Call LLM
-    response = call_anthropic(
+    system_prompt = await assemble_prompt(workspace_id)
+    response = await call_llm(
         system_prompt,
         request.history or [],
-        request.message
+        request.message,
+        request.provider,
+        request.model
     )
-    
-    # Process memory updates
-    clean_response, memory_updated = process_memory_updates(
-        workspace,
-        request.persona,
-        response
+    clean_response, memory_updated = await process_memory_updates(
+        workspace_id, None, response
     )
     
     return ChatResponse(
         response=clean_response,
-        memory_updated=memory_updated,
-        persona=request.persona
+        workspace_id=workspace_id,
+        memory_updated=memory_updated
     )
 
 
-@app.get("/workspaces/{workspace_id}/files/{persona}/{filename}")
-async def get_file(workspace_id: str, persona: str, filename: str):
-    """Get a specific file from a persona."""
-    workspace = get_workspace(workspace_id)
-    path = f"personas/{persona}/{filename}"
-    content = get_file_content(workspace, path)
+@app.post("/workspaces/{workspace_id}/personas/{persona}/chat", response_model=ChatResponse)
+async def chat_with_persona(workspace_id: str, persona: str, request: ChatRequest):
+    """Chat with a specific persona."""
+    workspace = await database.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
     
-    if content is None:
-        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    # Verify persona exists
+    files = workspace.get("files", {})
+    persona_prefix = f"personas/{persona}/"
+    has_persona = any(
+        path.startswith(persona_prefix)
+        for path in (files.keys() if isinstance(files, dict) else [])
+    )
     
-    return {"path": path, "content": content}
+    if not has_persona:
+        raise HTTPException(status_code=404, detail=f"Persona '{persona}' not found")
+    
+    system_prompt = await assemble_prompt(workspace_id, persona)
+    response = await call_llm(
+        system_prompt,
+        request.history or [],
+        request.message,
+        request.provider,
+        request.model
+    )
+    clean_response, memory_updated = await process_memory_updates(
+        workspace_id, persona, response
+    )
+    
+    return ChatResponse(
+        response=clean_response,
+        workspace_id=workspace_id,
+        persona=persona,
+        memory_updated=memory_updated
+    )
+
+
+# Legacy endpoint (for backwards compatibility with simple /chat)
+@app.post("/chat", response_model=ChatResponse)
+async def chat_simple(request: dict):
+    """Simple chat endpoint (backwards compatible)."""
+    workspace_id = request.get("workspace_id")
+    persona = request.get("persona")
+    message = request.get("message")
+    history = request.get("history", [])
+    
+    if not workspace_id or not message:
+        raise HTTPException(status_code=400, detail="workspace_id and message required")
+    
+    workspace = await database.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    
+    system_prompt = await assemble_prompt(workspace_id, persona)
+    response = await call_llm(system_prompt, history, message)
+    clean_response, memory_updated = await process_memory_updates(
+        workspace_id, persona, response
+    )
+    
+    return ChatResponse(
+        response=clean_response,
+        workspace_id=workspace_id,
+        persona=persona,
+        memory_updated=memory_updated
+    )
 
 
 if __name__ == "__main__":
