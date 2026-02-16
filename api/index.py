@@ -288,33 +288,46 @@ def chat(workspace_id):
 
 @app.route("/api/workspaces/<workspace_id>/personas/<persona>/chat", methods=["POST"])
 def chat_with_persona(workspace_id, persona):
-    workspace = get_workspace(workspace_id)
-    if not workspace:
-        return jsonify({"error": "Workspace not found"}), 404
-    
-    files = workspace.get("files", {})
-    persona_prefix = f"personas/{persona}/"
-    has_persona = any(path.startswith(persona_prefix) for path in (files.keys() if isinstance(files, dict) else []))
-    
-    if not has_persona:
-        return jsonify({"error": f"Persona '{persona}' not found"}), 404
-    
-    data = request.get_json()
-    message = data.get("message")
-    provider = data.get("provider", "anthropic")
-    model = data.get("model")
-    history = data.get("history", [])
-    
-    if not message:
-        return jsonify({"error": "message required"}), 400
-    
-    system_prompt = assemble_prompt(workspace_id, persona)
-    response = call_llm(system_prompt, history, message, provider, model)
-    clean_response, memory_updated = process_memory_updates(workspace_id, persona, response)
-    
-    return jsonify({
-        "response": clean_response,
-        "workspace_id": workspace_id,
-        "persona": persona,
-        "memory_updated": memory_updated
-    })
+    try:
+        workspace = get_workspace(workspace_id)
+        if not workspace:
+            return jsonify({"error": "Workspace not found"}), 404
+        
+        files = workspace.get("files", {})
+        persona_prefix = f"personas/{persona}/"
+        has_persona = any(path.startswith(persona_prefix) for path in (files.keys() if isinstance(files, dict) else []))
+        
+        if not has_persona:
+            return jsonify({"error": f"Persona '{persona}' not found"}), 404
+        
+        data = request.get_json()
+        message = data.get("message")
+        provider = data.get("provider", "anthropic")
+        model = data.get("model")
+        history = data.get("history", [])
+        
+        if not message:
+            return jsonify({"error": "message required"}), 400
+        
+        # Check API key
+        if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+            return jsonify({"error": "ANTHROPIC_API_KEY not configured"}), 500
+        if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+            return jsonify({"error": "OPENAI_API_KEY not configured"}), 500
+        
+        system_prompt = assemble_prompt(workspace_id, persona)
+        response = call_llm(system_prompt, history, message, provider, model)
+        clean_response, memory_updated = process_memory_updates(workspace_id, persona, response)
+        
+        return jsonify({
+            "response": clean_response,
+            "workspace_id": workspace_id,
+            "persona": persona,
+            "memory_updated": memory_updated
+        })
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "type": type(e).__name__,
+            "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY"))
+        }), 500
