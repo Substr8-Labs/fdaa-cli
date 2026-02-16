@@ -61,10 +61,13 @@ def get_files(workspace_id):
     if workspace:
         files = workspace.get("files", {})
         if isinstance(files, dict):
-            return {
-                path: (f["content"] if isinstance(f, dict) else f)
-                for path, f in files.items()
-            }
+            result = {}
+            for path, f in files.items():
+                if isinstance(f, dict):
+                    result[path] = f.get("content", "")
+                else:
+                    result[path] = f if f else ""
+            return result
     return {}
 
 
@@ -154,7 +157,11 @@ def call_llm(system_prompt, history, message, provider="anthropic", model=None):
             system=system_prompt,
             messages=messages,
         )
-        return response.content[0].text
+        # Handle response - could be list of content blocks
+        if hasattr(response, 'content') and len(response.content) > 0:
+            return response.content[0].text
+        else:
+            raise ValueError(f"Unexpected Anthropic response: {response}")
     elif provider == "openai":
         from openai import OpenAI
         client = OpenAI()
