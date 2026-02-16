@@ -12,7 +12,7 @@ import os
 import re
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 
@@ -528,6 +528,67 @@ def log_skill_activation(workspace_id, skill_id, persona, trigger_message, statu
     return str(result.inserted_id)
 
 
+def check_rate_limit(workspace_id, skill_id, persona):
+    """
+    Check if skill activation is within rate limits.
+    Returns {"allowed": bool, "reason": str, "usage": {...}}
+    """
+    db = get_db()
+    if db is None:
+        return {"allowed": True, "reason": "No database"}
+    
+    # Get skill rate limits
+    skill = get_skill(workspace_id, skill_id)
+    if not skill:
+        return {"allowed": True, "reason": "Skill not found"}
+    
+    rate_limit = skill.get("permissions", {}).get("rate_limit", {})
+    if not rate_limit:
+        return {"allowed": True, "reason": "No rate limit configured"}
+    
+    now = datetime.now(timezone.utc)
+    
+    # Check hourly limit
+    hourly_limit = rate_limit.get("requests_per_hour")
+    if hourly_limit:
+        hour_ago = now - timedelta(hours=1)
+        hourly_count = db.skill_executions.count_documents({
+            "workspace_id": workspace_id,
+            "skill_id": skill_id,
+            "persona": persona,
+            "status": "activated",
+            "timestamp": {"$gte": hour_ago}
+        })
+        
+        if hourly_count >= hourly_limit:
+            return {
+                "allowed": False,
+                "reason": f"Hourly limit exceeded ({hourly_count}/{hourly_limit})",
+                "usage": {"hourly": hourly_count, "hourly_limit": hourly_limit}
+            }
+    
+    # Check daily limit
+    daily_limit = rate_limit.get("requests_per_day")
+    if daily_limit:
+        day_ago = now - timedelta(days=1)
+        daily_count = db.skill_executions.count_documents({
+            "workspace_id": workspace_id,
+            "skill_id": skill_id,
+            "persona": persona,
+            "status": "activated",
+            "timestamp": {"$gte": day_ago}
+        })
+        
+        if daily_count >= daily_limit:
+            return {
+                "allowed": False,
+                "reason": f"Daily limit exceeded ({daily_count}/{daily_limit})",
+                "usage": {"daily": daily_count, "daily_limit": daily_limit}
+            }
+    
+    return {"allowed": True, "reason": "Within limits"}
+
+
 def get_skill_audit(workspace_id, skill_id=None, persona=None, limit=100):
     """Query skill execution audit log."""
     db = get_db()
@@ -599,24 +660,25 @@ def match_skills(user_message, skill_index):
 
 def activate_skills_with_permissions(workspace_id, persona, user_message):
     """
-    Full skill activation with permission checks.
-    Returns {"activated": [...], "blocked": [...]}
+    Full skill activation with permission and rate limit checks.
+    Returns {"activated": [...], "blocked": [...], "rate_limited": [...]}
     """
     # Get skill index
     skill_index = get_skill_index(workspace_id)
     if not skill_index:
-        return {"activated": [], "blocked": []}
+        return {"activated": [], "blocked": [], "rate_limited": []}
     
     # Match skills to message
     matched_ids = match_skills(user_message, skill_index)
     if not matched_ids:
-        return {"activated": [], "blocked": []}
+        return {"activated": [], "blocked": [], "rate_limited": []}
     
     # Get persona permissions
     persona_perms = get_persona_permissions(workspace_id, persona)
     
     activated = []
     blocked = []
+    rate_limited = []
     
     for skill_id in matched_ids:
         skill = get_skill(workspace_id, skill_id)
@@ -636,6 +698,20 @@ def activate_skills_with_permissions(workspace_id, persona, user_message):
             log_skill_activation(workspace_id, skill_id, persona, user_message, status="blocked")
             continue
         
+        # Check rate limit
+        rate_check = check_rate_limit(workspace_id, skill_id, persona)
+        
+        if not rate_check["allowed"]:
+            rate_limited.append({
+                "skill_id": skill_id,
+                "name": skill.get("name", skill_id),
+                "reason": rate_check["reason"],
+                "usage": rate_check.get("usage", {})
+            })
+            # Log rate limited
+            log_skill_activation(workspace_id, skill_id, persona, user_message, status="rate_limited")
+            continue
+        
         # Skill is activated
         activated.append({
             "skill_id": skill_id,
@@ -648,7 +724,7 @@ def activate_skills_with_permissions(workspace_id, persona, user_message):
         # Log successful activation
         log_skill_activation(workspace_id, skill_id, persona, user_message, status="activated")
     
-    return {"activated": activated, "blocked": blocked}
+    return {"activated": activated, "blocked": blocked, "rate_limited": rate_limited}
 
 
 # =============================================================================
@@ -953,6 +1029,7 @@ def get_persona_context(workspace_id, persona):
         # Use permission-aware activation if message provided
         activated_skills = []
         blocked_skills = []
+        rate_limited_skills = []
         
         if user_message and skill_index:
             activation = activate_skills_with_permissions(workspace_id, persona, user_message)
@@ -961,6 +1038,7 @@ def get_persona_context(workspace_id, persona):
                 for s in activation["activated"]
             ]
             blocked_skills = activation["blocked"]
+            rate_limited_skills = activation.get("rate_limited", [])
         
         return jsonify({
             "workspace_id": workspace_id,
@@ -968,7 +1046,8 @@ def get_persona_context(workspace_id, persona):
             "system_prompt": system_prompt,
             "available_skills": len(skill_index),
             "activated_skills": activated_skills,
-            "blocked_skills": blocked_skills
+            "blocked_skills": blocked_skills,
+            "rate_limited_skills": rate_limited_skills
         })
     except Exception as e:
         return jsonify({"error": str(e), "type": type(e).__name__}), 500
