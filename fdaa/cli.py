@@ -822,5 +822,151 @@ def pipeline(skill_path: str, key: str, skip_verify: bool, skip_sandbox: bool):
     console.print(f"Skill verified and registered: {sig.skill_id}\n")
 
 
+@main.command()
+@click.argument("skill_spec")
+@click.option("--dir", "-d", "install_dir", default=None, help="Installation directory")
+@click.option("--no-verify", is_flag=True, help="Skip signature verification")
+def install(skill_spec: str, install_dir: str, no_verify: bool):
+    """Install a skill from the registry.
+    
+    Downloads a verified skill and installs it locally.
+    Verifies cryptographic signature by default.
+    
+    Examples:
+        fdaa install weather-skill
+        fdaa install weather-skill@1.2.0
+        fdaa install weather-skill --dir ./my-skills
+    """
+    from .registry_client import RegistryClient
+    
+    console.print(f"\n[bold]📦 FDAA Install[/bold]")
+    console.print(f"[dim]Skill: {skill_spec}[/dim]\n")
+    
+    client = RegistryClient()
+    dest = Path(install_dir) if install_dir else None
+    
+    with console.status("[bold blue]Installing...[/bold blue]"):
+        result = client.install(skill_spec, install_dir=dest, verify=not no_verify)
+    
+    if result.success:
+        console.print(f"[green]✓ Installed:[/green] {result.skill_name}@{result.version}")
+        console.print(f"[dim]Location: {result.install_path}[/dim]\n")
+    else:
+        console.print(f"[red]✗ Failed:[/red] {result.error}\n")
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("skill_path")
+@click.option("--name", "-n", default=None, help="Skill name (default: directory name)")
+@click.option("--version", "-v", default="1.0.0", help="Semantic version")
+@click.option("--author", "-a", default=None, help="Author name/email")
+@click.option("--key", "-k", default="default", help="Signing key name")
+@click.option("--skip-verify", is_flag=True, help="Skip verification pipeline")
+def publish(skill_path: str, name: str, version: str, author: str, key: str, skip_verify: bool):
+    """Publish a skill to the registry.
+    
+    Runs verification pipeline, signs the skill, and uploads to registry.
+    
+    Examples:
+        fdaa publish ./my-skill
+        fdaa publish ./my-skill --version 1.2.0
+        fdaa publish ./my-skill --name cool-skill --author "me@example.com"
+    """
+    from .registry_client import RegistryClient
+    
+    skill_path_obj = Path(skill_path)
+    
+    if not skill_path_obj.exists():
+        console.print(f"[red]Error:[/red] Path not found: {skill_path}")
+        sys.exit(1)
+    
+    if not (skill_path_obj / "SKILL.md").exists():
+        console.print(f"[red]Error:[/red] SKILL.md not found in {skill_path}")
+        sys.exit(1)
+    
+    console.print(f"\n[bold]🚀 FDAA Publish[/bold]")
+    console.print(f"[dim]Skill: {skill_path}[/dim]")
+    console.print(f"[dim]Version: {version}[/dim]\n")
+    
+    client = RegistryClient()
+    
+    with console.status("[bold blue]Publishing...[/bold blue]"):
+        result = client.publish(
+            skill_path_obj,
+            name=name,
+            version=version,
+            author=author,
+            key_name=key,
+            run_pipeline=not skip_verify,
+        )
+    
+    if result.success:
+        console.print(f"[green]✓ Published:[/green] {name or skill_path_obj.name}@{version}")
+        console.print(f"[dim]Skill ID: {result.skill_id}[/dim]")
+        console.print(f"[dim]Registry: {result.registry_url}[/dim]\n")
+    else:
+        console.print(f"[red]✗ Failed:[/red] {result.error}\n")
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("query")
+@click.option("--limit", "-l", default=20, help="Max results")
+def search(query: str, limit: int):
+    """Search for skills in the registry.
+    
+    Example: fdaa search weather
+    """
+    from .registry_client import RegistryClient
+    
+    console.print(f"\n[bold]🔍 FDAA Search:[/bold] {query}\n")
+    
+    client = RegistryClient()
+    
+    with console.status("[bold blue]Searching...[/bold blue]"):
+        results = client.search(query, limit=limit)
+    
+    if not results:
+        console.print("[dim]No skills found.[/dim]\n")
+        return
+    
+    for skill in results:
+        console.print(f"  [bold]{skill.name}[/bold] v{skill.version}")
+        console.print(f"    {skill.description[:80]}...")
+        console.print(f"    [dim]by {skill.author} | {skill.downloads} downloads[/dim]")
+        console.print()
+
+
+@main.command(name="list")
+@click.option("--dir", "-d", "install_dir", default=None, help="Skills directory")
+def list_skills(install_dir: str):
+    """List installed skills.
+    
+    Example: fdaa list
+    """
+    from .registry_client import RegistryClient
+    
+    console.print(f"\n[bold]📋 Installed Skills[/bold]\n")
+    
+    client = RegistryClient()
+    dest = Path(install_dir) if install_dir else None
+    
+    installed = client.list_installed(dest)
+    
+    if not installed:
+        console.print("[dim]No skills installed.[/dim]")
+        console.print("[dim]Use 'fdaa install <skill>' to install one.[/dim]\n")
+        return
+    
+    for skill in installed:
+        verified = "[green]✓[/green]" if skill["verified"] else "[yellow]?[/yellow]"
+        console.print(f"  {verified} [bold]{skill['name']}[/bold]")
+        console.print(f"    [dim]{skill['path']}[/dim]")
+        if skill["skill_id"]:
+            console.print(f"    [dim]ID: {skill['skill_id']}[/dim]")
+        console.print()
+
+
 if __name__ == "__main__":
     main()
