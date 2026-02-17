@@ -1896,3 +1896,298 @@ def api_waitlist():
         "active": active,
         "recent": recent
     })
+
+
+# =============================================================================
+# MCP Gateway API (Phase 2)
+# =============================================================================
+
+# In-memory gateway registry (for serverless, this resets per invocation)
+# Production would use MongoDB to persist gateway configs
+_gateways = {}
+
+
+@app.route("/api/mcp/gateways")
+def list_mcp_gateways():
+    """
+    List configured MCP gateways.
+    
+    Returns gateway configurations and stats.
+    """
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    gateways = list(db.mcp_gateways.find({}, {"_id": 0}))
+    
+    return jsonify({
+        "gateways": gateways,
+        "count": len(gateways)
+    })
+
+
+@app.route("/api/mcp/gateways", methods=["POST"])
+def register_mcp_gateway():
+    """
+    Register a new MCP gateway configuration.
+    
+    Body:
+    {
+        "gateway_id": "github-readonly",
+        "server": "@anthropic/mcp-server-github",
+        "description": "Read-only GitHub access",
+        "policy": {
+            "mode": "allowlist",
+            "tools": [
+                {"name": "get_file_contents", "category": "read"},
+                {"name": "search_code", "category": "read"}
+            ]
+        },
+        "env_keys": ["GITHUB_TOKEN"]  // Required env vars (not the values)
+    }
+    """
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    data = request.get_json() or {}
+    
+    gateway_id = data.get("gateway_id")
+    if not gateway_id:
+        return jsonify({"error": "gateway_id required"}), 400
+    
+    server = data.get("server")
+    if not server:
+        return jsonify({"error": "server required"}), 400
+    
+    now = datetime.now(timezone.utc)
+    
+    doc = {
+        "gateway_id": gateway_id,
+        "server": server,
+        "description": data.get("description", ""),
+        "policy": data.get("policy", {"mode": "allowlist", "tools": []}),
+        "env_keys": data.get("env_keys", []),
+        "enabled": data.get("enabled", True),
+        "created_at": now,
+        "updated_at": now,
+    }
+    
+    # Upsert
+    db.mcp_gateways.replace_one(
+        {"gateway_id": gateway_id},
+        doc,
+        upsert=True
+    )
+    
+    return jsonify({
+        "status": "registered",
+        "gateway_id": gateway_id,
+        "server": server
+    })
+
+
+@app.route("/api/mcp/gateways/<gateway_id>")
+def get_mcp_gateway(gateway_id):
+    """Get a specific gateway configuration."""
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    gateway = db.mcp_gateways.find_one({"gateway_id": gateway_id}, {"_id": 0})
+    
+    if not gateway:
+        return jsonify({"error": f"Gateway '{gateway_id}' not found"}), 404
+    
+    return jsonify(gateway)
+
+
+@app.route("/api/mcp/gateways/<gateway_id>", methods=["DELETE"])
+def delete_mcp_gateway(gateway_id):
+    """Delete a gateway configuration."""
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    result = db.mcp_gateways.delete_one({"gateway_id": gateway_id})
+    
+    if result.deleted_count == 0:
+        return jsonify({"error": f"Gateway '{gateway_id}' not found"}), 404
+    
+    return jsonify({"status": "deleted", "gateway_id": gateway_id})
+
+
+@app.route("/api/mcp/gateways/<gateway_id>/policy", methods=["GET", "PUT"])
+def mcp_gateway_policy(gateway_id):
+    """Get or update gateway policy."""
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    gateway = db.mcp_gateways.find_one({"gateway_id": gateway_id})
+    if not gateway:
+        return jsonify({"error": f"Gateway '{gateway_id}' not found"}), 404
+    
+    if request.method == "GET":
+        return jsonify({
+            "gateway_id": gateway_id,
+            "policy": gateway.get("policy", {})
+        })
+    
+    # PUT - update policy
+    data = request.get_json() or {}
+    policy = data.get("policy", {})
+    
+    db.mcp_gateways.update_one(
+        {"gateway_id": gateway_id},
+        {"$set": {"policy": policy, "updated_at": datetime.now(timezone.utc)}}
+    )
+    
+    return jsonify({
+        "status": "updated",
+        "gateway_id": gateway_id,
+        "policy": policy
+    })
+
+
+@app.route("/api/mcp/audit")
+def mcp_audit_log():
+    """
+    Query MCP audit log.
+    
+    Params: ?gateway_id=&tool=&persona=&limit=
+    """
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    gateway_id = request.args.get("gateway_id")
+    tool = request.args.get("tool")
+    persona = request.args.get("persona")
+    limit = request.args.get("limit", 100, type=int)
+    
+    query = {}
+    if gateway_id:
+        query["gateway_id"] = gateway_id
+    if tool:
+        query["tool"] = tool
+    if persona:
+        query["persona"] = persona
+    
+    audit = list(db.mcp_audit.find(query, {"_id": 0}).sort("timestamp", -1).limit(limit))
+    
+    return jsonify({
+        "count": len(audit),
+        "entries": audit
+    })
+
+
+@app.route("/api/mcp/call", methods=["POST"])
+def mcp_call_tool():
+    """
+    Call a tool through an MCP gateway.
+    
+    Body:
+    {
+        "gateway_id": "github-readonly",
+        "tool": "get_file_contents",
+        "arguments": {"path": "README.md", "repo": "org/repo"},
+        "persona": "ada",
+        "role": "developer"
+    }
+    
+    Note: This endpoint is for demonstration/testing.
+    In production, the gateway would run as a persistent process,
+    not spawned per-request (serverless limitation).
+    """
+    # Rate limit: chat category
+    allowed, info = check_rate_limit("chat")
+    if not allowed:
+        return rate_limit_response(info)
+    
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    data = request.get_json() or {}
+    
+    gateway_id = data.get("gateway_id")
+    tool = data.get("tool")
+    arguments = data.get("arguments", {})
+    persona = data.get("persona")
+    role = data.get("role")
+    
+    if not gateway_id:
+        return jsonify({"error": "gateway_id required"}), 400
+    if not tool:
+        return jsonify({"error": "tool required"}), 400
+    
+    # Get gateway config
+    gateway_config = db.mcp_gateways.find_one({"gateway_id": gateway_id})
+    if not gateway_config:
+        return jsonify({"error": f"Gateway '{gateway_id}' not found"}), 404
+    
+    if not gateway_config.get("enabled", True):
+        return jsonify({"error": "Gateway is disabled"}), 403
+    
+    # Check policy
+    policy = gateway_config.get("policy", {})
+    policy_mode = policy.get("mode", "allowlist")
+    tools_config = {t["name"]: t for t in policy.get("tools", [])}
+    
+    tool_config = tools_config.get(tool)
+    
+    # Policy check
+    if policy_mode == "allowlist":
+        if tool_config is None:
+            # Log and reject
+            _log_mcp_audit(db, gateway_id, tool, persona, False, "Not in allowlist", arguments)
+            return jsonify({
+                "error": f"Tool '{tool}' not allowed by policy",
+                "reason": "Not in allowlist"
+            }), 403
+        
+        if not tool_config.get("allowed", True):
+            _log_mcp_audit(db, gateway_id, tool, persona, False, "Explicitly blocked", arguments)
+            return jsonify({
+                "error": f"Tool '{tool}' is blocked",
+                "reason": "Explicitly blocked"
+            }), 403
+    
+    # Check if approval required
+    if tool_config and tool_config.get("requires_approval"):
+        # For demo, we'll just note this - real implementation would queue for approval
+        _log_mcp_audit(db, gateway_id, tool, persona, False, "Requires approval", arguments)
+        return jsonify({
+            "error": "This tool requires approval",
+            "requires_approval": True,
+            "tool": tool,
+            "category": tool_config.get("category", "unknown")
+        }), 202  # Accepted but pending
+    
+    # For demo purposes: Log that the call WOULD be made
+    # (We can't actually spawn MCP servers in Vercel serverless)
+    _log_mcp_audit(db, gateway_id, tool, persona, True, "Allowed by policy", arguments)
+    
+    return jsonify({
+        "status": "simulated",
+        "message": "In production, this would execute via MCP gateway",
+        "gateway_id": gateway_id,
+        "tool": tool,
+        "arguments": arguments,
+        "policy_check": "passed",
+        "note": "Serverless environment cannot spawn MCP processes. Use CLI for real execution."
+    })
+
+
+def _log_mcp_audit(db, gateway_id, tool, persona, allowed, reason, arguments):
+    """Log an MCP audit entry."""
+    db.mcp_audit.insert_one({
+        "gateway_id": gateway_id,
+        "tool": tool,
+        "persona": persona,
+        "allowed": allowed,
+        "reason": reason,
+        "arguments": arguments,
+        "timestamp": datetime.now(timezone.utc)
+    })
