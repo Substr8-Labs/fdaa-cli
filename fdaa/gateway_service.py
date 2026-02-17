@@ -155,7 +155,7 @@ class GatewayPool:
     def _audit_callback(self, entry: AuditEntry):
         """Log audit entry to MongoDB."""
         db = get_db()
-        if db:
+        if db is not None:
             db.mcp_audit.insert_one(entry.to_dict())
     
     async def disconnect_all(self):
