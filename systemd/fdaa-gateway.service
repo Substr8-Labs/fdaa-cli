@@ -1,0 +1,29 @@
+[Unit]
+Description=FDAA MCP Gateway Service
+Documentation=https://github.com/Substr8-Labs/fdaa-cli
+After=network.target mongod.service
+
+[Service]
+Type=simple
+User=claw
+Group=claw
+WorkingDirectory=/home/claw/fdaa-cli
+Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="MONGODB_URI=mongodb://localhost:27017/fdaa"
+Environment="GATEWAY_PORT=8766"
+
+# Load secrets from file if exists
+EnvironmentFile=-/home/claw/.fdaa/secrets.env
+
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python -m fdaa.gateway_service
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
