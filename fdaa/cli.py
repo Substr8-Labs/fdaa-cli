@@ -968,5 +968,196 @@ def list_skills(install_dir: str):
         console.print()
 
 
+@main.command()
+@click.argument("skill_path")
+@click.option("--model", "-m", default=None, help="Model for analysis")
+@click.option("--provider", "-p", default=None, type=click.Choice(["anthropic", "openai"]))
+@click.option("--no-sandbox", is_flag=True, help="Skip sandbox execution")
+@click.option("--no-sign", is_flag=True, help="Skip signing")
+@click.option("--key", "-k", default="default", help="Signing key name")
+@click.option("--jaeger-host", default=None, help="Jaeger agent host")
+def traced_pipeline(skill_path: str, model: str, provider: str, no_sandbox: bool, no_sign: bool, key: str, jaeger_host: str):
+    """Run verification pipeline with full OpenTelemetry tracing.
+    
+    Exports traces to:
+    - Jaeger (if available) for standard tracing UI
+    - FDAA Console (~/.fdaa/traces/) for reasoning visibility
+    
+    Example: fdaa traced-pipeline ./my-skill
+    """
+    from .telemetry import init_telemetry
+    from .telemetry.instrumented_pipeline import traced_verify_skill
+    import json as json_lib
+    
+    skill_path_obj = Path(skill_path)
+    
+    if not skill_path_obj.exists():
+        console.print(f"[red]Error:[/red] Path not found: {skill_path}")
+        sys.exit(1)
+    
+    console.print(f"\n[bold]🔍 FDAA Traced Pipeline[/bold]")
+    console.print(f"[dim]Skill: {skill_path}[/dim]")
+    console.print(f"[dim]Tracing: Jaeger + FDAA Console[/dim]\n")
+    
+    # Initialize telemetry
+    init_telemetry(
+        service_name="fdaa-cli",
+        jaeger_host=jaeger_host,
+        enable_jaeger=jaeger_host is not None,
+        enable_fdaa=True,
+    )
+    
+    console.print("[bold]Running instrumented pipeline...[/bold]\n")
+    
+    result = traced_verify_skill(
+        str(skill_path_obj),
+        model=model,
+        provider=provider,
+        run_sandbox=not no_sandbox,
+        sign_result=not no_sign,
+        key_name=key,
+    )
+    
+    # Display results
+    console.print("[bold]━━━ Pipeline Results ━━━[/bold]\n")
+    
+    # Verdict
+    verdict_color = "green" if result["verdict"] == "passed" else "red"
+    console.print(f"[bold]Verdict:[/bold] [{verdict_color}]{result['verdict'].upper()}[/{verdict_color}]")
+    console.print(f"[bold]Trace ID:[/bold] {result['trace_id']}")
+    console.print()
+    
+    # Tier results
+    console.print("[bold]Tier Results:[/bold]")
+    for tier, tier_result in result.get("tier_results", {}).items():
+        if tier_result.get("skipped"):
+            status = "[yellow]⏭ SKIPPED[/yellow]"
+        elif tier_result.get("passed", tier_result.get("signed")):
+            status = "[green]✓ PASSED[/green]"
+        else:
+            status = "[red]✗ FAILED[/red]"
+        
+        console.print(f"  {tier.upper()}: {status}")
+        
+        # Show details
+        if "scope_drift_score" in tier_result:
+            console.print(f"    [dim]Scope Drift: {tier_result['scope_drift_score']}/100[/dim]")
+        if "duration_ms" in tier_result:
+            console.print(f"    [dim]Duration: {tier_result['duration_ms']}ms[/dim]")
+        if "skill_id" in tier_result:
+            console.print(f"    [dim]Skill ID: {tier_result['skill_id']}[/dim]")
+    
+    console.print()
+    console.print(f"[dim]Trace saved to: ~/.fdaa/traces/{result['trace_id']}.json[/dim]")
+    console.print(f"[dim]View with: fdaa trace {result['trace_id']}[/dim]\n")
+    
+    sys.exit(0 if result["verdict"] == "passed" else 1)
+
+
+@main.command()
+@click.argument("trace_id", required=False)
+@click.option("--list", "-l", "list_traces", is_flag=True, help="List recent traces")
+@click.option("--limit", "-n", default=20, help="Number of traces to list")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+def trace(trace_id: str, list_traces: bool, limit: int, output_json: bool):
+    """View FDAA verification traces.
+    
+    Examples:
+        fdaa trace --list              # List recent traces
+        fdaa trace <trace-id>          # View specific trace
+        fdaa trace <trace-id> --json   # Output as JSON
+    """
+    from .telemetry.exporter import FDAAExporter
+    import json as json_lib
+    
+    exporter = FDAAExporter()
+    
+    if list_traces or not trace_id:
+        console.print(f"\n[bold]📋 Recent FDAA Traces[/bold]\n")
+        
+        traces = exporter.list_traces(limit=limit)
+        
+        if not traces:
+            console.print("[dim]No traces found.[/dim]")
+            console.print("[dim]Run 'fdaa traced-pipeline <skill>' to generate traces.[/dim]\n")
+            return
+        
+        for t in traces:
+            verdict_icon = "✓" if t.get("verdict") == "passed" else "✗" if t.get("verdict") == "failed" else "?"
+            verdict_color = "green" if t.get("verdict") == "passed" else "red" if t.get("verdict") == "failed" else "yellow"
+            
+            console.print(f"  [{verdict_color}]{verdict_icon}[/{verdict_color}] [bold]{t['trace_id'][:16]}...[/bold]")
+            console.print(f"    Skill: {t.get('skill_path', 'unknown')}")
+            console.print(f"    Time: {t.get('started_at', 'unknown')}")
+            if t.get("duration_ms"):
+                console.print(f"    Duration: {t['duration_ms']:.0f}ms")
+            if t.get("total_llm_cost_usd"):
+                console.print(f"    LLM Cost: ${t['total_llm_cost_usd']:.4f}")
+            console.print()
+        
+        return
+    
+    # View specific trace
+    trace_data = exporter.get_trace(trace_id)
+    
+    if not trace_data:
+        # Try partial match
+        traces = exporter.list_traces(limit=100)
+        matches = [t for t in traces if t["trace_id"].startswith(trace_id)]
+        
+        if len(matches) == 1:
+            trace_data = exporter.get_trace(matches[0]["trace_id"])
+        elif len(matches) > 1:
+            console.print(f"[yellow]Multiple traces match '{trace_id}':[/yellow]")
+            for t in matches[:5]:
+                console.print(f"  {t['trace_id']}")
+            return
+        else:
+            console.print(f"[red]Trace not found:[/red] {trace_id}")
+            return
+    
+    if output_json:
+        console.print(json_lib.dumps(trace_data, indent=2, default=str))
+        return
+    
+    # Rich display
+    console.print(f"\n[bold]🔍 FDAA Trace: {trace_data['trace_id'][:16]}...[/bold]\n")
+    
+    console.print(f"[bold]Skill:[/bold] {trace_data.get('skill_path', 'unknown')}")
+    console.print(f"[bold]Started:[/bold] {trace_data.get('started_at', 'unknown')}")
+    console.print(f"[bold]Duration:[/bold] {trace_data.get('duration_ms', 0):.0f}ms")
+    console.print(f"[bold]Verdict:[/bold] {trace_data.get('verdict', 'unknown')}")
+    console.print(f"[bold]LLM Tokens:[/bold] {trace_data.get('total_llm_tokens', 0)}")
+    console.print(f"[bold]LLM Cost:[/bold] ${trace_data.get('total_llm_cost_usd', 0):.4f}")
+    console.print()
+    
+    # Show spans
+    console.print("[bold]Spans:[/bold]")
+    spans = trace_data.get("spans", [])
+    for span in sorted(spans, key=lambda s: s.get("start_time", "")):
+        indent = "  " if span.get("parent_span_id") else ""
+        duration = span.get("duration_ms", 0)
+        
+        console.print(f"{indent}├── [cyan]{span['name']}[/cyan] ({duration:.0f}ms)")
+        
+        # Show LLM details if present
+        if span.get("llm_model"):
+            console.print(f"{indent}│   [dim]Model: {span['llm_model']}[/dim]")
+        if span.get("llm_tokens_in"):
+            console.print(f"{indent}│   [dim]Tokens: {span['llm_tokens_in']} in / {span.get('llm_tokens_out', 0)} out[/dim]")
+        if span.get("llm_prompt_preview"):
+            preview = span["llm_prompt_preview"][:80] + "..." if len(span["llm_prompt_preview"]) > 80 else span["llm_prompt_preview"]
+            console.print(f"{indent}│   [dim]Prompt: {preview}[/dim]")
+        if span.get("llm_response_preview"):
+            preview = span["llm_response_preview"][:80] + "..." if len(span["llm_response_preview"]) > 80 else span["llm_response_preview"]
+            console.print(f"{indent}│   [dim]Response: {preview}[/dim]")
+        
+        # Show sandbox details
+        if span.get("sandbox_exit_code") is not None:
+            console.print(f"{indent}│   [dim]Exit code: {span['sandbox_exit_code']}[/dim]")
+    
+    console.print()
+
+
 if __name__ == "__main__":
     main()
