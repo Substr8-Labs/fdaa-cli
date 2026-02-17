@@ -50,6 +50,91 @@ def get_db():
 
 
 # =============================================================================
+# API Rate Limiting
+# =============================================================================
+
+# Default rate limits per endpoint category
+RATE_LIMITS = {
+    "chat": {"requests": 20, "window_seconds": 60},      # 20 req/min
+    "waitlist": {"requests": 5, "window_seconds": 60},   # 5 req/min (prevent spam)
+    "read": {"requests": 100, "window_seconds": 60},     # 100 req/min
+    "write": {"requests": 30, "window_seconds": 60},     # 30 req/min
+    "default": {"requests": 60, "window_seconds": 60},   # 60 req/min
+}
+
+
+def get_client_ip():
+    """Get client IP from request headers (handles proxies)."""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def check_rate_limit(endpoint_category="default"):
+    """
+    Check if request is within rate limits.
+    Returns (allowed: bool, info: dict)
+    """
+    db = get_db()
+    if db is None:
+        return True, {"reason": "no_db"}  # Allow if no DB
+    
+    ip = get_client_ip()
+    limits = RATE_LIMITS.get(endpoint_category, RATE_LIMITS["default"])
+    window = timedelta(seconds=limits["window_seconds"])
+    max_requests = limits["requests"]
+    
+    now = datetime.now(timezone.utc)
+    window_start = now - window
+    
+    # Count requests in current window
+    key = f"{ip}:{endpoint_category}"
+    
+    # Clean old entries and count current
+    db.rate_limits.delete_many({
+        "key": key,
+        "timestamp": {"$lt": window_start}
+    })
+    
+    count = db.rate_limits.count_documents({
+        "key": key,
+        "timestamp": {"$gte": window_start}
+    })
+    
+    if count >= max_requests:
+        return False, {
+            "limit": max_requests,
+            "window_seconds": limits["window_seconds"],
+            "current": count,
+            "retry_after": limits["window_seconds"]
+        }
+    
+    # Record this request
+    db.rate_limits.insert_one({
+        "key": key,
+        "ip": ip,
+        "endpoint": endpoint_category,
+        "timestamp": now
+    })
+    
+    return True, {
+        "limit": max_requests,
+        "remaining": max_requests - count - 1,
+        "window_seconds": limits["window_seconds"]
+    }
+
+
+def rate_limit_response(info):
+    """Return a 429 Too Many Requests response."""
+    return jsonify({
+        "error": "Rate limit exceeded",
+        "limit": info.get("limit"),
+        "retry_after": info.get("retry_after"),
+        "message": f"Too many requests. Limit: {info.get('limit')} per {info.get('window_seconds')}s"
+    }), 429
+
+
+# =============================================================================
 # Database Operations
 # =============================================================================
 
@@ -909,9 +994,43 @@ app = Flask(__name__)
 def root():
     return jsonify({
         "name": "FDAA API",
-        "version": "0.4.0",
-        "features": ["workspaces", "personas", "skills", "snapshotting", "permissions", "audit"],
+        "version": "0.5.0",
+        "features": ["workspaces", "personas", "skills", "snapshotting", "permissions", "audit", "rate-limiting"],
         "docs": "/api/workspaces"
+    })
+
+
+@app.route("/api/rate-limit-status")
+def api_rate_limit_status():
+    """Check your current rate limit status."""
+    ip = get_client_ip()
+    db = get_db()
+    
+    if db is None:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    now = datetime.now(timezone.utc)
+    status = {}
+    
+    for category, limits in RATE_LIMITS.items():
+        window = timedelta(seconds=limits["window_seconds"])
+        window_start = now - window
+        
+        count = db.rate_limits.count_documents({
+            "key": f"{ip}:{category}",
+            "timestamp": {"$gte": window_start}
+        })
+        
+        status[category] = {
+            "used": count,
+            "limit": limits["requests"],
+            "remaining": max(0, limits["requests"] - count),
+            "window_seconds": limits["window_seconds"]
+        }
+    
+    return jsonify({
+        "ip": ip,
+        "limits": status
     })
 
 
@@ -973,6 +1092,11 @@ def get_workspace_info(workspace_id):
 
 @app.route("/api/workspaces/<workspace_id>/chat", methods=["POST"])
 def chat(workspace_id):
+    # Rate limit: 20 requests per minute for chat
+    allowed, info = check_rate_limit("chat")
+    if not allowed:
+        return rate_limit_response(info)
+    
     workspace = get_workspace(workspace_id)
     if workspace is None:
         return jsonify({"error": "Workspace not found"}), 404
@@ -1096,6 +1220,11 @@ def update_persona_memory(workspace_id, persona):
 
 @app.route("/api/workspaces/<workspace_id>/personas/<persona>/chat", methods=["POST"])
 def chat_with_persona(workspace_id, persona):
+    # Rate limit: 20 requests per minute for chat
+    allowed, info = check_rate_limit("chat")
+    if not allowed:
+        return rate_limit_response(info)
+    
     try:
         workspace = get_workspace(workspace_id)
         if workspace is None:
@@ -1703,6 +1832,11 @@ def api_waitlist():
     POST: Add email to waitlist
     GET: Get waitlist stats (admin)
     """
+    # Rate limit: 5 requests per minute for waitlist
+    allowed, info = check_rate_limit("waitlist")
+    if not allowed:
+        return rate_limit_response(info)
+    
     db = get_db()
     if db is None:
         return jsonify({"error": "Database not configured"}), 500
