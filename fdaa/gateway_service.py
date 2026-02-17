@@ -207,6 +207,7 @@ class ToolCallRequest(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict)
     persona: Optional[str] = None
     role: Optional[str] = None
+    reasoning: Optional[str] = Field(None, description="Agent's reasoning for this call (the 'why')")
 
 
 class ApprovalRequest(BaseModel):
@@ -390,7 +391,8 @@ async def call_tool(gateway_id: str, request: ToolCallRequest):
         tool_name=request.tool,
         arguments=request.arguments,
         persona=request.persona,
-        role=request.role
+        role=request.role,
+        reasoning=request.reasoning
     )
     
     if not result.success:

@@ -47,6 +47,9 @@ class AuditEntry:
     allowed: bool
     policy_reason: str
     
+    # Reasoning trace (the "why" - required for regulated industries)
+    reasoning: Optional[str] = None
+    
     # Approval (if required)
     approval_required: bool = False
     approval_status: Optional[ApprovalStatus] = None
@@ -69,6 +72,7 @@ class AuditEntry:
             "role": self.role,
             "allowed": self.allowed,
             "policy_reason": self.policy_reason,
+            "reasoning": self.reasoning,
             "approval_required": self.approval_required,
             "approval_status": self.approval_status.value if self.approval_status else None,
             "approved_by": self.approved_by,
@@ -202,6 +206,7 @@ class MCPGateway:
         arguments: Dict[str, Any] = None,
         persona: str = None,
         role: str = None,
+        reasoning: str = None,  # Agent's reasoning for this call (the "why")
         skip_approval: bool = False,  # For pre-approved calls
     ) -> MCPResult:
         """
@@ -235,6 +240,7 @@ class MCPGateway:
             role=role,
             allowed=allowed,
             policy_reason=reason,
+            reasoning=reasoning,
             arguments=arguments,
         )
         

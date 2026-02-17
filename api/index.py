@@ -824,15 +824,20 @@ def activate_skills_with_permissions(workspace_id, persona, user_message):
 # =============================================================================
 
 def format_skill_index(skill_index):
-    """Format skill index for system prompt injection."""
+    """
+    Format skill index for system prompt injection.
+    
+    Uses XML structure for Claude - research shows XML provides
+    stricter boundaries that prevent models from escaping instruction blocks.
+    """
     if not skill_index:
         return ""
     
-    lines = ["\n\n### Available Skills\n"]
-    lines.append("You have access to the following skills. Use them when relevant:\n")
+    lines = ["\n\n<available_skills>"]
     for skill in skill_index:
-        verified = " ✓" if skill.get("verified") else ""
-        lines.append(f"- **{skill['name']}**{verified}: {skill['description']}")
+        verified = " verified=\"true\"" if skill.get("verified") else ""
+        lines.append(f"  <skill name=\"{skill['name']}\"{verified}>{skill['description']}</skill>")
+    lines.append("</available_skills>")
     lines.append("\nTo use a skill, mention it by name and the system will provide full instructions.\n")
     return "\n".join(lines)
 
@@ -911,10 +916,16 @@ When you learn something important, include a memory update block:
     sections.append(system_instructions)
     
     # Add activated skill instructions (Tier 2)
+    # Using XML delimiters for Claude - provides stricter boundaries
+    # that prevent models from "escaping" instruction blocks
     if activated_skills:
         skills_content = "## Activated Skills\n\n"
         for skill in activated_skills:
-            skills_content += f"### {skill['name']}\n\n{skill['instructions']}\n\n"
+            skills_content += f"""<skill_instructions name="{skill['name']}" type="{skill.get('type', 'knowledge')}">
+{skill['instructions']}
+</skill_instructions>
+
+"""
         sections.append(skills_content)
     
     return "\n\n---\n\n".join(sections)
@@ -994,7 +1005,7 @@ app = Flask(__name__)
 def root():
     return jsonify({
         "name": "FDAA API",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "features": ["workspaces", "personas", "skills", "snapshotting", "permissions", "audit", "rate-limiting"],
         "docs": "/api/workspaces"
     })
