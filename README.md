@@ -296,3 +296,28 @@ fdaa install github:Substr8-Labs/skill-hello-world
 ```
 
 Browse available skills: https://github.com/Substr8-Labs/fdaa-registry
+
+## DCT — Delegation Capability Tokens
+
+Cryptographic permission delegation between agents.
+
+```bash
+# Create a token granting specific permissions
+fdaa dct create "file:read:/home/user/*" "api:call:weather" --expires 60
+
+# Verify a token
+fdaa dct verify ./token.json
+
+# Check if a permission is granted
+fdaa dct check ./token.json "file:read:/home/user/doc.txt"
+
+# Delegate a subset to another agent (monotonic attenuation)
+fdaa dct attenuate ./parent.json "file:read:/home/user/docs/*" --expires 30
+```
+
+**Key properties:**
+- Ed25519 signatures (tamper-proof)
+- Time-bounded (expires)
+- Monotonic attenuation (can only delegate subsets, never escalate)
+- Delegation chains tracked (audit trail)
+
