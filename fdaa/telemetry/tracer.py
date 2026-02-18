@@ -61,7 +61,7 @@ def init_telemetry(
     # Create resource with service info
     resource = Resource.create({
         ResourceAttributes.SERVICE_NAME: service_name,
-        ResourceAttributes.SERVICE_VERSION: "0.3.0",
+        ResourceAttributes.SERVICE_VERSION: "0.4.0",
         "fdaa.component": "cli",
     })
     

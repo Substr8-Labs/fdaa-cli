@@ -1,6 +1,6 @@
 [project]
 name = "fdaa"
-version = "0.3.0"
+version = "0.4.0"
 description = "File-Driven Agent Architecture - Reference Implementation"
 authors = [{name = "Substr8 Labs", email = "hello@substr8labs.com"}]
 readme = "README.md"
