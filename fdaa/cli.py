@@ -1161,3 +1161,239 @@ def trace(trace_id: str, list_traces: bool, limit: int, output_json: bool):
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================================
+# DCT Commands
+# ============================================================================
+
+@main.group()
+def dct():
+    """Delegation Capability Tokens - permission delegation between agents."""
+    pass
+
+
+@dct.command("create")
+@click.argument("permissions", nargs=-1, required=True)
+@click.option("-k", "--key", default="default", help="Signing key name")
+@click.option("-d", "--delegate", default="*", help="Delegate public key (or * for bearer)")
+@click.option("-e", "--expires", default=60, type=int, help="Expiry in minutes")
+@click.option("--redelegable", default=0, type=int, help="Max re-delegations allowed")
+@click.option("-o", "--output", help="Output file (default: ~/.fdaa/tokens/)")
+def dct_create(permissions, key, delegate, expires, redelegable, output):
+    """Create a new Delegation Capability Token.
+    
+    Examples:
+        fdaa dct create "file:read:/home/user/*"
+        fdaa dct create "file:read:/docs/*" "api:call:weather" --expires 30
+        fdaa dct create "exec:python" --delegate abc123... --redelegable 2
+    """
+    from .dct import create_token, save_token
+    
+    console.print("\n[bold]🔑 Create DCT[/bold]\n")
+    
+    try:
+        token = create_token(
+            delegator_key_name=key,
+            delegate_pubkey=delegate,
+            permissions=list(permissions),
+            expires_in_minutes=expires,
+            max_delegations=redelegable,
+        )
+        
+        if output:
+            path = save_token(token, Path(output))
+        else:
+            path = save_token(token)
+        
+        console.print(f"[green]✓ Token created:[/green] {token.token_id}")
+        console.print(f"[dim]Permissions:[/dim] {', '.join(str(p) for p in token.permissions)}")
+        console.print(f"[dim]Expires:[/dim] {token.constraints.expires_at}")
+        console.print(f"[dim]Saved to:[/dim] {path}\n")
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}\n")
+        sys.exit(1)
+
+
+@dct.command("verify")
+@click.argument("token_path")
+def dct_verify(token_path):
+    """Verify a DCT's signature and constraints.
+    
+    Example:
+        fdaa dct verify ~/.fdaa/tokens/abc123.json
+    """
+    from .dct import load_token, verify_token
+    
+    console.print("\n[bold]🔍 Verify DCT[/bold]\n")
+    
+    try:
+        token = load_token(token_path)
+        valid, reason = verify_token(token)
+        
+        if valid:
+            console.print(f"[green]✓ Valid[/green]")
+            console.print(f"[dim]Token ID:[/dim] {token.token_id}")
+            console.print(f"[dim]Delegator:[/dim] {token.delegator[:16]}...")
+            console.print(f"[dim]Permissions:[/dim] {len(token.permissions)}")
+            console.print(f"[dim]Expires:[/dim] {token.constraints.expires_at}\n")
+        else:
+            console.print(f"[red]✗ Invalid:[/red] {reason}\n")
+            sys.exit(1)
+            
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}\n")
+        sys.exit(1)
+
+
+@dct.command("inspect")
+@click.argument("token_path")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def dct_inspect(token_path, as_json):
+    """Inspect a DCT's contents.
+    
+    Example:
+        fdaa dct inspect ~/.fdaa/tokens/abc123.json
+    """
+    from .dct import load_token, verify_token
+    import json as json_lib
+    
+    try:
+        token = load_token(token_path)
+        
+        if as_json:
+            print(json_lib.dumps(token.to_dict(), indent=2))
+            return
+        
+        valid, reason = verify_token(token)
+        status = "[green]✓ Valid[/green]" if valid else f"[red]✗ {reason}[/red]"
+        
+        console.print(f"\n[bold]📋 DCT Details[/bold]\n")
+        console.print(f"[bold]Token ID:[/bold] {token.token_id}")
+        console.print(f"[bold]Status:[/bold] {status}")
+        console.print(f"[bold]Version:[/bold] {token.version}")
+        console.print(f"[bold]Delegator:[/bold] {token.delegator}")
+        console.print(f"[bold]Delegate:[/bold] {token.delegate}")
+        console.print(f"[bold]Issued:[/bold] {token.issued_at}")
+        console.print(f"[bold]Expires:[/bold] {token.constraints.expires_at}")
+        console.print(f"[bold]Re-delegable:[/bold] {token.constraints.max_delegations}x")
+        
+        if token.parent_token:
+            console.print(f"[bold]Parent Token:[/bold] {token.parent_token}")
+        
+        console.print(f"\n[bold]Permissions:[/bold]")
+        for p in token.permissions:
+            console.print(f"  • {p}")
+        
+        console.print()
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}\n")
+        sys.exit(1)
+
+
+@dct.command("check")
+@click.argument("token_path")
+@click.argument("permission")
+def dct_check(token_path, permission):
+    """Check if a token grants a specific permission.
+    
+    Example:
+        fdaa dct check ./token.json "file:read:/home/user/doc.txt"
+    """
+    from .dct import load_token, check_permission
+    
+    try:
+        token = load_token(token_path)
+        allowed = check_permission(token, permission)
+        
+        if allowed:
+            console.print(f"[green]✓ Allowed:[/green] {permission}")
+        else:
+            console.print(f"[red]✗ Denied:[/red] {permission}")
+            sys.exit(1)
+            
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}\n")
+        sys.exit(1)
+
+
+@dct.command("attenuate")
+@click.argument("parent_token_path")
+@click.argument("permissions", nargs=-1, required=True)
+@click.option("-k", "--key", default="default", help="Signing key name")
+@click.option("-d", "--delegate", default="*", help="Delegate public key")
+@click.option("-e", "--expires", default=60, type=int, help="Expiry in minutes")
+@click.option("-o", "--output", help="Output file")
+def dct_attenuate(parent_token_path, permissions, key, delegate, expires, output):
+    """Create an attenuated token from a parent token.
+    
+    The new token can only have a subset of the parent's permissions.
+    
+    Example:
+        fdaa dct attenuate ./parent.json "file:read:/docs/single.txt"
+    """
+    from .dct import load_token, attenuate_token, save_token
+    
+    console.print("\n[bold]🔑 Attenuate DCT[/bold]\n")
+    
+    try:
+        parent = load_token(parent_token_path)
+        
+        token = attenuate_token(
+            parent_token=parent,
+            delegator_key_name=key,
+            delegate_pubkey=delegate,
+            permissions=list(permissions),
+            expires_in_minutes=expires,
+        )
+        
+        if output:
+            path = save_token(token, Path(output))
+        else:
+            path = save_token(token)
+        
+        console.print(f"[green]✓ Attenuated token created:[/green] {token.token_id}")
+        console.print(f"[dim]Parent:[/dim] {parent.token_id}")
+        console.print(f"[dim]Permissions:[/dim] {', '.join(str(p) for p in token.permissions)}")
+        console.print(f"[dim]Expires:[/dim] {token.constraints.expires_at}")
+        console.print(f"[dim]Saved to:[/dim] {path}\n")
+        
+    except ValueError as e:
+        console.print(f"[red]✗ Attenuation error:[/red] {e}\n")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}\n")
+        sys.exit(1)
+
+
+@dct.command("list")
+@click.option("--valid-only", is_flag=True, help="Only show valid tokens")
+def dct_list(valid_only):
+    """List all saved tokens."""
+    from .dct import list_tokens, verify_token
+    
+    tokens = list_tokens()
+    
+    if not tokens:
+        console.print("\n[dim]No tokens found.[/dim]\n")
+        return
+    
+    console.print(f"\n[bold]📋 Saved Tokens ({len(tokens)})[/bold]\n")
+    
+    for token in tokens:
+        valid, reason = verify_token(token)
+        
+        if valid_only and not valid:
+            continue
+        
+        status = "✓" if valid else "✗"
+        color = "green" if valid else "red"
+        
+        console.print(f"[{color}]{status}[/{color}] {token.token_id[:8]}...")
+        console.print(f"    [dim]Permissions:[/dim] {len(token.permissions)}")
+        console.print(f"    [dim]Expires:[/dim] {token.constraints.expires_at}")
+        if not valid:
+            console.print(f"    [dim]Reason:[/dim] {reason}")
+        console.print()
