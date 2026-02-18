@@ -2,13 +2,9 @@
 
 **File-Driven Agent Architecture — Reference Implementation**
 
-A command-line tool for creating and interacting with file-driven AI agents.
+Build, verify, sign, and publish AI agent skills with cryptographic proof.
 
-## What is FDAA?
-
-File-Driven Agent Architecture is a pattern where AI agents are defined entirely through human-readable markdown files. No code changes, no fine-tuning, no config UI — just files.
-
-📄 [Read the whitepaper](https://github.com/Substr8-Labs/fdaa-spec)
+📄 [Whitepaper](https://github.com/Substr8-Labs/fdaa-spec) | 🔐 [ACC Spec](https://github.com/Substr8-Labs/acc-spec) | 🏢 [Substr8 Labs](https://substr8labs.com)
 
 ## Installation
 
@@ -16,170 +12,277 @@ File-Driven Agent Architecture is a pattern where AI agents are defined entirely
 pip install fdaa
 ```
 
-Or install from source:
-
-```bash
-git clone https://github.com/Substr8-Labs/fdaa-cli
-cd fdaa-cli
-pip install -e .
-```
+Requires Python 3.10+
 
 ## Quick Start
 
-### 1. Create an agent
+### For Skill Developers
 
+**1. Create a signing key (one-time)**
 ```bash
-fdaa init my-agent
+fdaa keygen mykey
 ```
 
-This creates a workspace with template files:
+**2. Write your skill**
 ```
-my-agent/
-├── IDENTITY.md   # Who the agent is
-├── SOUL.md       # How it thinks and behaves
-├── MEMORY.md     # What it remembers (writable)
-├── CONTEXT.md    # Current state (writable)
-└── TOOLS.md      # Capabilities
+my-skill/
+├── SKILL.md          # What it does
+├── scripts/
+│   └── run.py        # The code
+└── references/       # Supporting docs (optional)
 ```
 
-### 2. Customize your agent
-
-Edit the files to define your agent's personality:
-
+**3. Quick check (instant feedback)**
 ```bash
-# Edit identity
-nano my-agent/IDENTITY.md
-
-# Edit behavior
-nano my-agent/SOUL.md
+fdaa check ./my-skill
 ```
 
-### 3. Chat with your agent
-
+**4. Full verification + signing**
 ```bash
-export OPENAI_API_KEY=sk-...
-fdaa chat my-agent
+fdaa pipeline ./my-skill --key mykey
 ```
 
-Or use Anthropic:
+**5. Publish**
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-fdaa chat my-agent --provider anthropic
+fdaa publish ./my-skill --name @you/my-skill --version 1.0.0
 ```
 
-### 4. Watch memory persist
+### For Skill Users
 
-After your conversation, check what the agent remembered:
-
+**Install a verified skill**
 ```bash
-fdaa read my-agent MEMORY.md
+fdaa install @someone/cool-skill
 ```
+
+Signature is verified automatically. Tampered skills are rejected.
+
+---
 
 ## Commands
 
+### Verification Pipeline
+
 | Command | Description |
 |---------|-------------|
-| `fdaa init <name>` | Create a new agent workspace |
-| `fdaa chat <workspace>` | Start a chat session |
-| `fdaa files <workspace>` | List workspace files |
-| `fdaa read <workspace> <file>` | Read a specific file |
+| `fdaa check <path>` | Fast pattern check (~1s) |
+| `fdaa verify <path>` | Guard Model security scan |
+| `fdaa sandbox <path>` | Run in isolated container |
+| `fdaa pipeline <path>` | Full Tier 1-4 verification |
+
+### Signing & Keys
+
+| Command | Description |
+|---------|-------------|
+| `fdaa keygen <name>` | Generate Ed25519 key pair |
+| `fdaa sign <path>` | Sign a skill |
+
+### Registry
+
+| Command | Description |
+|---------|-------------|
+| `fdaa install <spec>` | Install a skill |
+| `fdaa publish <path>` | Publish to registry |
+| `fdaa search <query>` | Search skills |
+| `fdaa list-skills` | List installed skills |
+
+### Tracing (OpenTelemetry)
+
+| Command | Description |
+|---------|-------------|
+| `fdaa traced-pipeline <path>` | Run pipeline with tracing |
+| `fdaa trace <id>` | View a trace |
+| `fdaa trace --list` | List recent traces |
+
+### Agent Workspaces
+
+| Command | Description |
+|---------|-------------|
+| `fdaa init <name>` | Create agent workspace |
+| `fdaa chat <workspace>` | Chat with agent |
+| `fdaa files <workspace>` | List files |
+| `fdaa read <workspace> <file>` | Read file |
 | `fdaa export <workspace>` | Export as zip |
 | `fdaa import <zip>` | Import from zip |
 
-## Chat Commands
+---
 
-While in a chat session:
+## Verification Tiers
 
-| Command | Description |
-|---------|-------------|
-| `exit` | End the session |
-| `/files` | List workspace files |
-| `/read <file>` | Read a file |
-| `/edit <file>` | Edit a file in $EDITOR |
+FDAA uses defense-in-depth with 4 verification tiers:
 
-## W^X Policy
+| Tier | What It Does | Speed |
+|------|--------------|-------|
+| **1. Fast Pass** | Pattern matching, known signatures | ~100ms |
+| **2. Guard Model** | LLM semantic analysis | ~3-5s |
+| **3. Sandbox** | Isolated execution, behavior monitoring | ~1-2s |
+| **4. Registry** | Cryptographic signing, hash verification | ~100ms |
 
-The agent can only write to certain files:
+```bash
+# Run all tiers
+fdaa pipeline ./my-skill --key mykey
 
-| File | Agent Can Write |
-|------|-----------------|
-| `IDENTITY.md` | ❌ No |
+# Skip expensive steps during development
+fdaa pipeline ./my-skill --skip-sandbox --skip-sign
+```
+
+---
+
+## Tracing & Observability
+
+Every pipeline run can be traced with OpenTelemetry:
+
+```bash
+fdaa traced-pipeline ./my-skill
+
+# Output:
+# Trace ID: f8112ae3...
+# View with: fdaa trace f8112ae3
+```
+
+View trace details:
+```bash
+fdaa trace f8112ae3
+
+# Shows:
+# - Duration per tier
+# - LLM tokens & cost
+# - Sandbox metrics
+# - Verification results
+```
+
+Export to Jaeger:
+```bash
+fdaa traced-pipeline ./my-skill --jaeger-host localhost
+```
+
+---
+
+## Skill Format
+
+A minimal skill:
+
+```
+my-skill/
+├── SKILL.md
+└── scripts/
+    └── run.py
+```
+
+**SKILL.md**
+```markdown
+---
+name: my-skill
+description: Does something useful
+version: 1.0.0
+---
+
+# My Skill
+
+Use this skill to do X.
+
+## Usage
+
+\`\`\`bash
+my-skill --input foo
+\`\`\`
+```
+
+After signing, a `MANIFEST.json` is added:
+```json
+{
+  "name": "@you/my-skill",
+  "version": "1.0.0",
+  "sha256": "7a3f2b...",
+  "signature": "Kx8mQ2...",
+  "publicKey": "a1b2c3...",
+  "signedAt": "2026-02-18T00:00:00Z"
+}
+```
+
+---
+
+## W^X Security
+
+FDAA enforces Write XOR Execute:
+
+| File | Agent Can Modify |
+|------|------------------|
+| `SKILL.md` | ❌ No |
 | `SOUL.md` | ❌ No |
+| `IDENTITY.md` | ❌ No |
 | `MEMORY.md` | ✅ Yes |
-| `CONTEXT.md` | ✅ Yes |
-| `TOOLS.md` | ❌ No |
+| `scripts/*` | ❌ No |
 
-This prevents the agent from modifying its own core identity.
+Agents cannot modify their own identity or capabilities.
 
-## Providers
+---
 
-Supported LLM providers:
+## Environment Variables
 
-- **OpenAI** (default): GPT-4o
-- **Anthropic**: Claude Sonnet
-
-Set the appropriate API key:
 ```bash
-export OPENAI_API_KEY=sk-...
-# or
+# LLM Providers (one required for verify/pipeline)
 export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
+
+# Optional
+export FDAA_REGISTRY_URL=https://registry.fdaa.dev
+export JAEGER_AGENT_HOST=localhost
 ```
 
-## Portability
+---
 
-Export your agent:
-```bash
-fdaa export my-agent -o my-agent.zip
-```
+## API Server
 
-Import on another machine:
-```bash
-fdaa import my-agent.zip
-fdaa chat my-agent
-```
-
-The agent's identity, personality, and memories all travel with it.
-
-## API Server (Optional)
-
-For multi-tenant or web deployments, FDAA includes a FastAPI server with MongoDB backend:
+For web deployments:
 
 ```bash
-# Install server dependencies
 pip install fdaa[server]
 
-# Set environment variables
 export MONGODB_URI="mongodb+srv://..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Run server
 uvicorn fdaa.server:app --host 0.0.0.0 --port 8000
 ```
 
-### API Endpoints
+See [API docs](docs/API.md) for endpoints.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/workspaces` | GET | List all workspaces |
-| `/workspaces/{id}` | GET | Get workspace |
-| `/workspaces/{id}/chat` | POST | Chat (no persona) |
-| `/workspaces/{id}/personas/{persona}/chat` | POST | Chat with persona |
-| `/workspaces/{id}/files` | GET | List files |
-| `/workspaces/{id}/files/{path}` | GET/PUT | Read/write file |
+---
 
-### Chat Request
+## Examples
 
+**Verify a skill before installing:**
 ```bash
-curl -X POST http://localhost:8000/workspaces/my-agent/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Hello!"}'
+fdaa verify ./untrusted-skill --provider anthropic
 ```
+
+**Create and publish a skill:**
+```bash
+fdaa keygen mykey
+mkdir my-skill && cd my-skill
+echo "# My Skill" > SKILL.md
+fdaa pipeline . --key mykey
+fdaa publish . --name @me/my-skill --version 1.0.0
+```
+
+**Debug a failing verification:**
+```bash
+fdaa traced-pipeline ./my-skill
+fdaa trace <trace-id>
+```
+
+**Install from GitHub (Phase 0 registry):**
+```bash
+fdaa install github:substr8-labs/skill-code-review
+```
+
+---
 
 ## License
 
 MIT
 
-## About
+---
 
-Built by [Substr8 Labs](https://substr8labs.com) as a reference implementation for the [FDAA specification](https://github.com/Substr8-Labs/fdaa-spec).
-# Redeploy trigger Mon Feb 16 23:02:35 UTC 2026
+Built by [Substr8 Labs](https://substr8labs.com)
+
+Research: [FDAA Whitepaper](https://doi.org/10.5281/zenodo.18675147) | [ACC Spec](https://doi.org/10.5281/zenodo.18675149)
