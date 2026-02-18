@@ -286,3 +286,13 @@ MIT
 Built by [Substr8 Labs](https://substr8labs.com)
 
 Research: [FDAA Whitepaper](https://doi.org/10.5281/zenodo.18675147) | [ACC Spec](https://doi.org/10.5281/zenodo.18675149)
+
+## Registry (Phase 0)
+
+Skills live on GitHub. Install directly:
+
+```bash
+fdaa install github:Substr8-Labs/skill-hello-world
+```
+
+Browse available skills: https://github.com/Substr8-Labs/fdaa-registry

@@ -359,13 +359,26 @@ class RegistryClient:
         """Install a skill from the registry.
         
         Args:
-            skill_spec: Skill name or name@version
+            skill_spec: Skill name, name@version, or github:owner/repo
             install_dir: Where to install (default: ./skills/)
             verify: Whether to verify signature
         
         Returns:
             InstallResult with installation status
+        
+        Examples:
+            fdaa install weather-skill
+            fdaa install weather-skill@1.2.0
+            fdaa install github:substr8-labs/skill-weather
+            fdaa install github:substr8-labs/skill-weather@v1.0.0
         """
+        install_dir = install_dir or Path.cwd() / "skills"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Handle github: prefix (Phase 0)
+        if skill_spec.startswith("github:"):
+            return self._install_from_github(skill_spec[7:], install_dir, verify)
+        
         # Parse skill spec
         if "@" in skill_spec:
             name, version = skill_spec.rsplit("@", 1)
@@ -373,15 +386,210 @@ class RegistryClient:
             name = skill_spec
             version = "latest"
         
-        install_dir = install_dir or Path.cwd() / "skills"
-        install_dir.mkdir(parents=True, exist_ok=True)
-        
         # Try remote registry first
         try:
             return self._install_from_remote(name, version, install_dir, verify)
         except RegistryError as e:
             # Fall back to local cache
             return self._install_from_cache(name, version, install_dir, verify)
+    
+    def _install_from_github(
+        self,
+        repo_spec: str,
+        install_dir: Path,
+        verify: bool
+    ) -> InstallResult:
+        """Install skill directly from GitHub repository.
+        
+        Phase 0 registry: skills live in GitHub repos.
+        
+        Args:
+            repo_spec: owner/repo or owner/repo@tag
+            install_dir: Where to install
+            verify: Whether to verify signature
+        
+        Returns:
+            InstallResult
+        """
+        import zipfile
+        import io
+        
+        # Parse repo spec
+        if "@" in repo_spec:
+            repo_path, ref = repo_spec.rsplit("@", 1)
+        else:
+            repo_path = repo_spec
+            ref = "main"  # Default branch
+        
+        if "/" not in repo_path:
+            return InstallResult(
+                success=False,
+                skill_name=repo_spec,
+                version="",
+                install_path="",
+                error="Invalid GitHub spec. Use: github:owner/repo"
+            )
+        
+        owner, repo = repo_path.split("/", 1)
+        skill_name = repo.replace("skill-", "")  # skill-weather -> weather
+        
+        # Download from GitHub
+        # Try tag/release first, fall back to branches (main and master)
+        urls_to_try = [
+            f"https://github.com/{owner}/{repo}/archive/refs/tags/{ref}.zip",
+            f"https://github.com/{owner}/{repo}/archive/refs/heads/{ref}.zip",
+            f"https://github.com/{owner}/{repo}/archive/{ref}.zip",
+        ]
+        
+        # If using default ref, also try common branch names
+        if ref == "main":
+            urls_to_try.extend([
+                f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip",
+                f"https://github.com/{owner}/{repo}/archive/master.zip",
+            ])
+        
+        zip_data = None
+        download_url = None
+        
+        for url in urls_to_try:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "fdaa-cli"})
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    zip_data = response.read()
+                    download_url = url
+                    break
+            except urllib.error.HTTPError:
+                continue
+            except urllib.error.URLError as e:
+                return InstallResult(
+                    success=False,
+                    skill_name=skill_name,
+                    version=ref,
+                    install_path="",
+                    error=f"Network error: {e.reason}"
+                )
+        
+        if zip_data is None:
+            return InstallResult(
+                success=False,
+                skill_name=skill_name,
+                version=ref,
+                install_path="",
+                error=f"Could not download from GitHub. Check that {owner}/{repo} exists and {ref} is a valid tag/branch."
+            )
+        
+        # Extract zip
+        extract_dir = Path(tempfile.mkdtemp())
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                zf.extractall(extract_dir)
+            
+            # Find the extracted directory (GitHub adds repo-branch prefix)
+            extracted_dirs = list(extract_dir.iterdir())
+            if not extracted_dirs:
+                return InstallResult(
+                    success=False,
+                    skill_name=skill_name,
+                    version=ref,
+                    install_path="",
+                    error="Empty archive from GitHub"
+                )
+            
+            source_dir = extracted_dirs[0]
+            
+            # Verify SKILL.md exists
+            if not (source_dir / "SKILL.md").exists():
+                return InstallResult(
+                    success=False,
+                    skill_name=skill_name,
+                    version=ref,
+                    install_path="",
+                    error="Not a valid skill: SKILL.md not found in repository"
+                )
+            
+            # Verify signature if requested and MANIFEST.json exists
+            manifest_path = source_dir / "MANIFEST.json"
+            signature_verified = False
+            
+            if verify and manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text())
+                    
+                    # Verify the signature
+                    # Map MANIFEST.json fields to SkillSignature fields
+                    # Use skill_path from manifest (original path when signed) for signature verification
+                    sig_data = {
+                        "skill_id": manifest.get("skill_id", f"{owner}/{repo}"),
+                        "skill_path": manifest.get("skill_path", str(source_dir)),
+                        "content_hash": manifest.get("sha256", ""),
+                        "scripts_merkle_root": manifest.get("scripts_merkle_root", ""),
+                        "references_merkle_root": manifest.get("references_merkle_root", ""),
+                        "verification_timestamp": manifest.get("signedAt", manifest.get("signed_at", "")),
+                        "verification_version": manifest.get("verification_version", "1.0.0"),
+                        "tier1_passed": manifest.get("verification", {}).get("tier1", True),
+                        "tier2_passed": manifest.get("verification", {}).get("tier2", True),
+                        "tier2_recommendation": manifest.get("verification", {}).get("tier2_recommendation", "approve"),
+                        "tier3_passed": manifest.get("verification", {}).get("tier3"),
+                        "signer_id": manifest.get("publicKey", manifest.get("signer_id", "")),
+                        "signature": manifest.get("signature", ""),
+                    }
+                    signature = SkillSignature.from_dict(sig_data)
+                    
+                    if verify_signature(signature):
+                        signature_verified = True
+                    else:
+                        return InstallResult(
+                            success=False,
+                            skill_name=skill_name,
+                            version=ref,
+                            install_path="",
+                            error="Signature verification failed. Use --no-verify to skip."
+                        )
+                except Exception as e:
+                    if verify:
+                        return InstallResult(
+                            success=False,
+                            skill_name=skill_name,
+                            version=ref,
+                            install_path="",
+                            error=f"Could not verify signature: {e}. Use --no-verify to skip."
+                        )
+            elif verify and not manifest_path.exists():
+                # No signature present - warn but allow with --no-verify
+                return InstallResult(
+                    success=False,
+                    skill_name=skill_name,
+                    version=ref,
+                    install_path="",
+                    error="No MANIFEST.json found - skill is unsigned. Use --no-verify to install anyway."
+                )
+            
+            # Copy to install directory
+            dest_path = install_dir / skill_name
+            if dest_path.exists():
+                shutil.rmtree(dest_path)
+            shutil.copytree(source_dir, dest_path)
+            
+            # Add source metadata
+            source_meta = {
+                "source": "github",
+                "repository": f"{owner}/{repo}",
+                "ref": ref,
+                "download_url": download_url,
+                "installed_at": datetime.now(timezone.utc).isoformat(),
+                "signature_verified": signature_verified,
+            }
+            (dest_path / ".fdaa-source.json").write_text(json.dumps(source_meta, indent=2))
+            
+            return InstallResult(
+                success=True,
+                skill_name=skill_name,
+                version=ref,
+                install_path=str(dest_path),
+            )
+            
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
     
     def _install_from_remote(
         self,
